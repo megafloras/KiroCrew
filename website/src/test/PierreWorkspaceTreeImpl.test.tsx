@@ -346,6 +346,20 @@ describe('PierreWorkspaceTreeImpl — changed mode', () => {
     await waitFor(() => expect(screen.getByText('Working tree clean')).toBeInTheDocument())
     expect(screen.queryByTestId('file-tree')).not.toBeInTheDocument()
   })
+
+  it('reports a changed-mode 503 instead of leaving the shimmer visible', async () => {
+    vi.mocked(api.projectGitStatus).mockRejectedValue(
+      Object.assign(new Error("Couldn't read the repository status."), {
+        status: 503,
+        code: 'git_status_unavailable',
+      }),
+    )
+
+    renderTree({ mode: 'changed' })
+
+    expect(await screen.findByTestId('workspace-tree-status-error')).toHaveTextContent(/repository status/i)
+    expect(screen.queryByRole('status', { name: 'Loading workspace…' })).not.toBeInTheDocument()
+  })
 })
 
 describe('PierreWorkspaceTreeImpl — selection wiring', () => {

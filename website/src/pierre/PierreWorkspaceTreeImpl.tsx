@@ -305,7 +305,7 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     refetchInterval: 10_000,
     refetchOnWindowFocus: true,
   })
-  const { data: status } = useQuery({
+  const { data: status, error: statusError } = useQuery({
     queryKey: ['git-status', projectDir],
     queryFn: () => api.projectGitStatus(projectDir),
     enabled: !!projectDir && (mode === 'changed' || !!tree?.repo),
@@ -589,6 +589,23 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     ),
     [],
   )
+
+  // A failed status request is terminal for this load. Changed mode has no
+  // other payload that can make the tree ready, so reuse the Git panel's
+  // unavailable notice instead of leaving the loading shimmer on screen.
+  if (mode === 'changed' && statusError) {
+    return (
+      <div className="h-full p-2">
+        <ErrorNotice
+          variant="inline"
+          className="whitespace-normal"
+          message={i18nT('components.gitPanel.status_failed')}
+          askAgent
+          testId="workspace-tree-status-error"
+        />
+      </div>
+    )
+  }
 
   // Data still in flight: an empty tree is indistinguishable from an empty
   // workspace, so show shimmer rows until the first payload decides which.
