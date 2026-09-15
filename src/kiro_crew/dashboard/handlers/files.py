@@ -2543,6 +2543,13 @@ class _TextRead(NamedTuple):
     content: str
 
 
+#: How much of a file the binary sniff reads before deciding, in BYTES. 8 KiB is
+#: the window the Files app already uses (``_is_binary_file`` in
+#: ``apps/builtins/file_explorer/server.py``); the two surfaces disagreeing about
+#: what "binary" means is a worse outcome than either window being wrong.
+_FILE_READ_SNIFF_BYTES = 8192
+
+
 def _read_request_path(raw: str, read_cap: int) -> _TextRead:
     """Validate, no-follow open and read a request path in ONE transaction.
 
@@ -2565,9 +2572,14 @@ def _read_request_path(raw: str, read_cap: int) -> _TextRead:
     What stays endpoint POLICY, per the prefix's own contract: the ``isdir``
     probe, because a READ distinguishes a directory from a missing path in its
     404 (it runs inside the transaction for the same reason the open does), and
-    the text decode -- a ``TextIOWrapper`` over the checked descriptor, so
-    ``read_cap`` still counts CHARACTERS. Counting bytes instead would mis-set
-    ``X-Truncated`` on multi-byte content.
+    the bounded byte snapshot used for both the binary verdict and text decode.
+    One snapshot prevents an in-place rewrite between two reads from pairing a
+    text verdict with binary bytes. The snapshot is ``read_cap * 4`` bytes (a
+    UTF-8 character is at most four bytes), decoded whole and sliced to
+    ``read_cap`` CHARACTERS, so multi-byte content does not mis-set
+    ``X-Truncated`` and a character split at the byte bound can only fall
+    beyond the slice. A file that itself ends mid-codepoint decodes to a
+    trailing U+FFFD, exactly as it did before this change.
 
     Pass ``read_cap`` 0 for the verdict only: HEAD answers from the stat and must
     open nothing.
@@ -2595,8 +2607,18 @@ def _read_request_path(raw: str, read_cap: int) -> _TextRead:
         # transaction), read_failed, file_too_large: the read did not happen.
         return _TextRead("read_failed", checked.path, "")
     try:
-        with io.TextIOWrapper(checked.file, encoding="utf-8", errors="replace") as text:
-            return _TextRead("file", checked.path, text.read(read_cap))
+        # Read one bounded byte snapshot for both the binary verdict and the
+        # content. Two descriptor reads would let an in-place rewrite pair a
+        # text verdict from the sniff with binary bytes from the later decode.
+        # The decode is deliberately lossy (``errors="replace"``), which is
+        # right for a text file with one bad byte and actively wrong for a .zip
+        # or a .sqlite. The sniff -- not an extension list -- remains the source
+        # of truth, so an extension-less binary is caught too.
+        with contextlib.closing(checked.file):
+            data = checked.file.read(read_cap * 4)
+        if b"\x00" in data[:_FILE_READ_SNIFF_BYTES]:
+            return _TextRead("binary", checked.path, "")
+        return _TextRead("file", checked.path, data.decode("utf-8", errors="replace")[:read_cap])
     except OSError:
         with contextlib.suppress(Exception):
             checked.file.close()
@@ -2811,6 +2833,20 @@ async def api_file_read(request: web.Request) -> web.Response:
     try:
         if outcome.kind == "read_failed":
             raise OSError(f"file_read could not read {path}")
+        if outcome.kind == "binary":
+            _sel().log_tool_invocation(
+                session_key="dashboard", tool_name="file_read", outcome="success", resources=path
+            )
+            # Empty content rather than decoded garbage, and the verdict as a
+            # HEADER as well as a body field: a .json TEXT file is served as
+            # ``application/json`` too, so the content type cannot tell this
+            # envelope apart from a file whose own body is JSON. The header and
+            # the empty body are the whole contract -- the panel's card names
+            # the file by its path and offers the download, nothing more.
+            return web.json_response(
+                {"binary": True, "content": ""},
+                headers={"X-File-Binary": "true"},
+            )
         content = outcome.content
         truncated = len(content) > read_cap
         content = content[:read_cap]
