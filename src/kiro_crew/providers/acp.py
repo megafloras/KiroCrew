@@ -32,6 +32,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
@@ -50,7 +51,6 @@ from kiro_crew.acp.types import (
     PROVIDER_LABEL_PI,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
-    acp_runtime_backends,
     effort_config_option_id,
 )
 from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
@@ -429,10 +429,14 @@ class AcpProvider(LLMProvider):
             if tool_search_min_tokens is None
             else tool_search_min_tokens
         )
-        if self.is_acp_runtime_backend:
+        if self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
             # Recover overlay-persisted levels (server-restart resilience) and
             # write the overlay BEFORE the first spawn so kiro-cli reads it on
             # session/new. Caller-provided overrides win — only fill gaps.
+            #
+            # The overlay set, not the transport set: the file belongs to the kiro
+            # family, and a harness that shares the runtime without reading it
+            # would seed its effort map out of another harness's file.
             try:
                 for m, lvl in _read_cli_overlay(self._client._work_dir).items():
                     self._effort_per_model.setdefault(m, lvl)
@@ -595,24 +599,26 @@ class AcpProvider(LLMProvider):
 
     @property
     def is_acp_runtime_backend(self) -> bool:
-        """True when this provider is served by AcpRuntime (kiro-cli or KAS).
+        """True when this provider is served by AcpRuntime rather than AcpClient.
 
-        Membership in ``ACP_BACKENDS_ACP_RUNTIME`` (harness-parity H5). Names
-        the "kiro or kas" set positively so the shared-runtime start path, the
-        cli.json overlay recovery, and the skip-live-effort branch stop being
-        spelled ``not is_claude_backend`` — which would hand the kiro-family
-        path to every harness added later. The claude AcpClient is deliberately
-        not a member: it runs one process per session and shares no runtime.
+        Membership in ``ACP_BACKENDS_ACP_RUNTIME`` (harness-parity H5), read
+        straight off the frozenset. Names the set positively so the start path
+        stops being spelled ``not is_claude_backend`` — which would hand the
+        shared-runtime path to every harness added later. The claude AcpClient is
+        deliberately not a member: it runs one process per session and shares no
+        runtime.
 
-        Reads ``acp_runtime_backends()`` rather than the set directly, so the
-        codex preview switch (``KIROCREW_CODEX_ACP_RUNTIME``, off by default) has
-        one home instead of one per foreground call site. With the switch off the
-        function returns ``ACP_BACKENDS_ACP_RUNTIME`` verbatim and this property
-        answers exactly the frozenset. This is the switch's ONLY reader in ``src``:
-        ``session._bg_runtime_backends`` reads the set, so background handles stay
-        off a codex runtime even with the switch on.
+        This answers ONE question, the transport, and it is worth saying what it
+        does not answer. Membership does not imply the kiro-family spawn
+        conventions: the cli.json effort and Tool Search overlay is gated on
+        ``ACP_BACKENDS_KIRO_SLASH_COMMANDS`` at every site that reads, writes or
+        clears it, because codex runs here and reads no such file. Nor does it
+        imply that a session can be disposed — that is
+        ``ACP_BACKENDS_SESSION_EVICTION``, a separate claim earned by a measured
+        teardown verb, and the reason the background path asks its own question
+        rather than reading this one.
         """
-        return self._client.backend in acp_runtime_backends()
+        return self._client.backend in ACP_BACKENDS_ACP_RUNTIME
 
     @property
     def is_session_sharing_eligible(self) -> bool:
@@ -1484,7 +1490,7 @@ class AcpProvider(LLMProvider):
             # Roll back to the prior state before propagating to the caller.
             if _prev is None:
                 self._effort_per_model.pop(model, None)
-                if self.is_acp_runtime_backend:
+                if self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
                     _clear_cli_overlay_effort(self._client._work_dir, model)
             else:
                 self._effort_per_model[model] = _prev

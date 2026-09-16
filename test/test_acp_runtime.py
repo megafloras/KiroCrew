@@ -2439,7 +2439,7 @@ async def test_is_stale_none_when_old_but_small_rss(monkeypatch):
     rt._max_age_secs = 6 * 3600
     rt._spawn_monotonic = time.monotonic() - 600.0  # older than the probe band
     rt._max_rss_mb = 500.0
-    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", lambda pid: 10.0)
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", lambda pid, depth=None: 10.0)
     assert await rt._is_stale() is None
 
 
@@ -2459,8 +2459,166 @@ async def test_is_stale_rss_when_tree_over_threshold(monkeypatch):
     rt._max_age_secs = 6 * 3600
     rt._spawn_monotonic = time.monotonic() - 600.0  # old enough to probe
     rt._max_rss_mb = 100.0
-    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", lambda pid: 250.0)
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", lambda pid, depth=None: 250.0)
     assert await rt._is_stale() == "rss"
+
+
+@pytest.mark.asyncio
+async def test_the_declared_reclaim_scope_reaches_the_probe(monkeypatch):
+    """A harness that bounds its RSS scope must have that bound actually applied.
+
+    The ceiling and the scope are one decision: applied without its scope, a
+    core-only ceiling is judged against a whole-subtree measurement, which for a
+    host whose subtree is dominated by a per-session fleet reads as a leak on the
+    first session and recycles a healthy process. Pinned on the ARGUMENT the probe
+    receives, because a policy field that is stored and never passed is exactly the
+    failure that looks correct in the policy object.
+    """
+    rt, _, _ = _make_runtime()
+    rt._max_age_secs = 6 * 3600
+    rt._spawn_monotonic = time.monotonic() - 600.0
+    rt._max_rss_mb = 1024.0
+    rt._max_rss_depth = 1
+    seen: list[object] = []
+
+    def _probe(pid, depth=None):
+        seen.append(depth)
+        return 250.0
+
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", _probe)
+    assert await rt._is_stale() is None
+    assert seen == [1]
+
+
+@pytest.mark.asyncio
+async def test_an_unbounded_scope_is_the_default_and_is_passed_as_such(monkeypatch):
+    """Every kiro-family host measures the whole subtree, and must keep doing so."""
+    rt, _, _ = _make_runtime()
+    rt._max_age_secs = 6 * 3600
+    rt._spawn_monotonic = time.monotonic() - 600.0
+    rt._max_rss_mb = 100.0
+    seen: list[object] = []
+
+    def _probe(pid, depth=None):
+        seen.append(depth)
+        return 250.0
+
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", _probe)
+    assert await rt._is_stale() == "rss"
+    assert seen == [None]
+
+
+def test_a_forking_sandbox_backend_adds_one_generation():
+    """``self._pid`` is the launcher there, not the adapter the harness counts from.
+
+    The probe is patched in the module that CALLS it, not in ``kiro_crew.sandbox``:
+    the harness binds the name at import, so patching the definition site leaves the
+    real backend probe in place and the assertion reads this host instead of the case.
+    """
+    from kiro_crew.acp.harness.codex import _sandbox_wrapper_generations
+
+    with patch("kiro_crew.acp.harness.codex.detect_backend", return_value="namespace"):
+        assert _sandbox_wrapper_generations("standard") == 1
+
+
+@pytest.mark.parametrize("backend", ["sandbox-exec", "none"])
+def test_an_execing_or_absent_backend_adds_none(backend):
+    """Both leave the adapter AS ``self._pid``, so a declared depth is already right."""
+    from kiro_crew.acp.harness.codex import _sandbox_wrapper_generations
+
+    with patch("kiro_crew.acp.harness.codex.detect_backend", return_value=backend):
+        assert _sandbox_wrapper_generations("standard") == 0
+
+
+def test_a_failed_probe_answers_zero_and_can_only_under_count():
+    """Fail-safe direction: an offset too small reaches the ceiling late, never early."""
+    from kiro_crew.acp.harness.codex import _sandbox_wrapper_generations
+
+    with patch("kiro_crew.acp.harness.codex.detect_backend", side_effect=OSError("boom")):
+        assert _sandbox_wrapper_generations("standard") == 0
+
+
+def test_the_spawn_path_does_not_branch_on_rss_depth():
+    """H13: a host-specific RSS scope adds no conditional to the shared spawn."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(AcpRuntime._spawn_admitted)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        attributes = {
+            child.attr for child in ast.walk(node.test) if isinstance(child, ast.Attribute)
+        }
+        assert attributes.isdisjoint({"rss_depth", "_max_rss_depth"})
+
+
+@pytest.mark.asyncio
+async def test_a_bounded_scope_is_offset_by_the_launcher_generation(monkeypatch):
+    """The bug this pins: a launcher counted as the adapter hides the growing child.
+
+    Under a forking backend the tree is launcher -> adapter -> app-server, so a
+    harness declaring "the adapter and its direct children" needs depth 2 measured
+    from ``self._pid``. Applied unoffset, the sum stops at the adapter -- which is
+    the FLAT process -- and the ceiling never sees the child that actually grows, so
+    the leak detector reads healthy forever.
+    """
+    rt, _, _ = _make_runtime()
+    rt._max_age_secs = 6 * 3600
+    rt._spawn_monotonic = time.monotonic() - 600.0
+    rt._max_rss_mb = 1024.0
+    rt._max_rss_depth = 2
+    seen: list[object] = []
+
+    def _probe(pid, depth=None):
+        seen.append(depth)
+        return 100.0
+
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", _probe)
+    assert await rt._is_stale() is None
+    assert seen == [2]
+
+
+@pytest.mark.asyncio
+async def test_the_offset_does_not_touch_an_unbounded_scope(monkeypatch):
+    """An extra generation at the top changes nothing when the whole subtree is summed.
+
+    So the offset must stay out of the kiro-family answer entirely rather than being
+    added and then ignored -- a None that arrives as an integer would silently bound
+    a measurement nothing asked to bound.
+    """
+    rt, _, _ = _make_runtime()
+    rt._max_age_secs = 6 * 3600
+    rt._spawn_monotonic = time.monotonic() - 600.0
+    rt._max_rss_mb = 100.0
+    rt._max_rss_depth = None
+    seen: list[object] = []
+
+    def _probe(pid, depth=None):
+        seen.append(depth)
+        return 250.0
+
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", _probe)
+    assert await rt._is_stale() == "rss"
+    assert seen == [None]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_bounded_measurement_does_not_recycle(monkeypatch):
+    """None is "unknown, do not judge" -- the platform without a bounded walk.
+
+    Answering with a subtree total there would apply a bounded host's ceiling to an
+    unbounded measurement. Abstaining leaves the age ceiling governing, which is why
+    a None must not read as a breach.
+    """
+    rt, _, _ = _make_runtime()
+    rt._max_age_secs = 6 * 3600
+    rt._spawn_monotonic = time.monotonic() - 600.0
+    rt._max_rss_mb = 1.0
+    rt._max_rss_depth = 1
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", lambda pid, depth=None: None)
+    assert await rt._is_stale() is None
 
 
 @pytest.mark.asyncio
