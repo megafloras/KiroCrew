@@ -61,7 +61,7 @@ from kiro_crew.acp.harness import (
 )
 from kiro_crew.acp.harness.kas import PROTOCOL_VERSION_KAS
 from kiro_crew.acp.harness.kiro import KIRO_CLI_SUBCMD, PROTOCOL_VERSION
-from kiro_crew.acp.kas_agents import hoist_managed_servers
+from kiro_crew.acp.kas_agents import hoist_managed_servers, load_agent_spec
 from kiro_crew.acp.kas_host_auth import HostAuthCallbackError
 from kiro_crew.acp.kas_transport import (
     KAS_AUTH_CALLBACK_ERROR_CODE,
@@ -97,7 +97,13 @@ from kiro_crew.acp.types import (
     JsonRpcRequest,
     backends_retired_by_host_logout,
 )
-from kiro_crew.agent import markdown_spec_for_agent
+from kiro_crew.agent import ensure_agent_materialized, markdown_spec_for_agent
+from kiro_crew.agent_sdk.tool_search import (
+    ToolSearchSettings,
+    kas_client_meta_settings,
+    spec_grants_tool_search,
+    with_client_meta_settings,
+)
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config import live
 from kiro_crew.config.paths import kiro_agents_dir
@@ -148,6 +154,7 @@ __all__ = [
     "AcpRuntime",
     "AcpRuntimeError",
     "AcpSessionStartTimeout",
+    "AcpToolSurfaceBindingError",
     "AcpWorkspaceBindingError",
     "AcpRuntimeDead",
     "AcpRequestTimeout",
@@ -170,7 +177,16 @@ _T = TypeVar("_T")
 
 
 class AcpWorkspaceBindingError(AcpRuntimeError):
-    """A live descriptor-bound runtime cannot safely serve another cwd."""
+    """A live runtime cannot safely serve this session; give it a runtime of its own.
+
+    Raised for another cwd on a descriptor-bound runtime, and by the subclass
+    below for a tool surface the process-wide settings would break. The
+    run-runtime caller answers both the same way: a dedicated runtime.
+    """
+
+
+class AcpToolSurfaceBindingError(AcpWorkspaceBindingError):
+    """A deferral-enabled process cannot serve an agent whose spec grants no loader."""
 
 
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
@@ -1216,6 +1232,7 @@ class AcpRuntime:
         acp_backend: str = ACP_BACKEND_KIRO,
         crew_agent: str = "",
         private_memory: bool = False,
+        tool_search: ToolSearchSettings | None = None,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -1233,6 +1250,13 @@ class AcpRuntime:
         # later sessions inherit the claiming crew, not the pool's spawn state.
         self._crew_agent = crew_agent
         self._acp_backend = acp_backend
+        # The operator's MCP Tool Search choice, for hosts that take it over the
+        # wire (``client_meta_settings``). None leaves the handshake as the harness
+        # declares it. ``_tool_search_wire`` is what was actually sent, kept so a
+        # later session on this process can be judged against the process-wide
+        # setting it inherits (see create_session).
+        self._tool_search = tool_search
+        self._tool_search_wire: dict[str, Any] = {}
         # Resolved on FIRST USE, never here: ``ACP_BACKENDS_KNOWN`` admits
         # backends the shared-process runtime has no harness for, and provider
         # safety constructs a runtime for every one of them to prove the reader
@@ -1903,6 +1927,15 @@ class AcpRuntime:
             argv = plan.argv
         except _KiroExecutableTrustError as exc:
             raise AcpRuntimeError(str(exc)) from exc
+        # The handshake declaration is the harness's constant. A host that takes
+        # feature settings over the wire (``client_meta_settings``, a positive
+        # membership answer) has its channel filled here -- BEFORE the process
+        # exists, right after the freshness gate above took its snapshot, so the
+        # spec read is the generation the child will load. Every other host reads
+        # its constant directly: no new await, no new step on that path.
+        client_capabilities = self._harness.client_capabilities
+        if self._harness.client_meta_settings:
+            client_capabilities = await self._handshake_client_capabilities()
 
         # OSS sandbox.wrap_argv supports (argv, mode, strip_python_env). The
         # MCP-gateway overlay is NOT delivered through the sandbox: its broker
@@ -2274,7 +2307,7 @@ class AcpRuntime:
                     # accepts, which would silently downgrade what a kiro session
                     # declares.
                     "protocolVersion": self._harness.protocol_version,
-                    "clientCapabilities": self._harness.client_capabilities,
+                    "clientCapabilities": client_capabilities,
                 },
             )
             _agent_caps = init_resp.get("agentCapabilities", {})
@@ -4128,6 +4161,101 @@ class AcpRuntime:
             await self.terminate_session(session_id)
             raise AcpRuntimeError(str(exc)) from exc
 
+    async def _handshake_client_capabilities(self) -> dict[str, Any]:
+        """The ``clientCapabilities`` this spawn sends, with the settings channel filled.
+
+        The harness declares the shape; this fills ``_meta.kiro.settings`` ONLY
+        for a host that reads it (``client_meta_settings``) and only with values
+        the operator threaded in. Today that is MCP Tool Search, and the value
+        sent is gated on the spawn agent's spec granting the ``tool_search``
+        loader: KAS defers every MCP spec when told to and never checks that a
+        loader is mounted, so a spec without the grant would run with its MCP
+        tools deferred and no way to load one. ``enabled`` therefore goes out as
+        an explicit false for such a spec rather than being left to the host's
+        default. The spec judged is the one the KAS projection will PUT ON THE
+        WIRE at session/new -- the freshness gate's snapshot for a derived agent,
+        else the user-level file ``load_agent_spec`` reads -- never a project
+        checkout's ``.kiro/agents`` spec, which that projection does not consult:
+        a project spec granting the loader while the projected user-level spec
+        does not would otherwise turn deferral on for a session with no loader.
+        An unreadable spec grants nothing (fail closed: ``enabled: false``).
+        """
+        base = self._harness.client_capabilities
+        if self._tool_search is None:
+            return base
+        spec = await asyncio.to_thread(self._projected_spawn_spec)
+        loader_granted = spec_grants_tool_search(spec)
+        settings = kas_client_meta_settings(self._tool_search, loader_granted=loader_granted)
+        self._tool_search_wire = settings
+        logger.info(
+            "AcpRuntime handshake: MCP Tool Search %s for agent=%s "
+            "(configured=%s, spec grants tool_search=%s)",
+            "enabled" if settings["toolSearch"]["enabled"] else "disabled",
+            self._agent or "<none>",
+            self._tool_search.enabled,
+            loader_granted,
+        )
+        return with_client_meta_settings(base, settings)
+
+    def _projected_spawn_spec(self) -> dict[str, Any] | None:
+        """The spawn agent's spec exactly as the wire projection will send it.
+
+        Blocking (a file read); callers run it off the loop. The derived-agent
+        branch reads NOTHING: the freshness gate that ran in ``_resolve_spawn_plan``
+        already verified those bytes, and a second read here would be a second
+        observation of a file a revocation could land in between. Every other
+        agent is read the way ``KasHarness.session_extras`` reads it, from the
+        user-level agents directory, so the two cannot disagree about which spec
+        a session runs.
+        """
+        snapshot = self._derived_spec_snapshot
+        spec = getattr(snapshot, "spec", None)
+        if isinstance(spec, dict):
+            return spec
+        # The same best-effort self-heal the projection runs before ITS read
+        # (``KasHarness.session_extras``): on a checkout that skipped setup the
+        # managed default does not exist yet, and reading it as absent here would
+        # decide "no loader" for the process while the projection, a moment later,
+        # materializes a spec that grants one.
+        ensure_agent_materialized(self._agent)
+        try:
+            return load_agent_spec(kiro_agents_dir(), self._agent)
+        except Exception:
+            logger.warning(
+                "agent %r: spec unreadable at spawn; MCP Tool Search stays off for this process",
+                self._agent or "<none>",
+                exc_info=True,
+            )
+            return None
+
+    def _refuse_if_loader_unreachable(self, active_agent: str, kas_agents: Any) -> None:
+        """Refuse a session whose projected spec cannot load what this process defers.
+
+        The Tool Search setting is process-wide on a wire-settings host: it was
+        decided at spawn from the spawn agent's spec as it stood then. What a
+        session RUNS is the projection built now -- a different agent, or the same
+        agent whose user-level spec has since lost the grant -- and if that grants
+        no loader its MCP specs would be deferred with no way back, the exact shape
+        the handshake gate prevents. So the projected payload is judged every
+        time, never the agent's name. There is no per-session knob to send, so the
+        session is refused as a binding error, which the run-runtime caller already
+        answers by giving the session a runtime of its own (whose handshake then
+        decides afresh); a foreground caller surfaces it as the session error.
+        """
+        # ``getattr``: a bare runtime built with ``object.__new__`` for the
+        # projection alone (the same shape ``_kas_custom_agents`` tolerates for
+        # ``_work_dir``) has never handshaken and so has nothing to enforce.
+        wire = getattr(self, "_tool_search_wire", {}).get("toolSearch")
+        if not (isinstance(wire, dict) and wire.get("enabled")) or not kas_agents:
+            return
+        if any(spec_grants_tool_search(a) for a in kas_agents if isinstance(a, dict)):
+            return
+        raise AcpToolSurfaceBindingError(
+            f"agent {active_agent!r} grants no tool_search loader, but this process "
+            f"(spawned for {self._agent!r}) runs with MCP Tool Search deferral on; "
+            "its MCP tools would be unreachable -- create a runtime for the agent"
+        )
+
     async def _kas_custom_agents(
         self, agent: str, *, member_dispatch: bool = False, session_key: str = ""
     ) -> SessionExtras:
@@ -4154,6 +4282,10 @@ class AcpRuntime:
             member_dispatch=member_dispatch,
             session_key=session_key,
         )
+        # Judged HERE, on the payload, so every path that builds one -- session/new
+        # and session/load alike -- is covered, and a host that builds none (kiro:
+        # ``custom_agents`` is None) never reaches the check.
+        self._refuse_if_loader_unreachable(agent, extras.custom_agents)
         return extras
 
     async def _session_start_budget(self) -> float:
