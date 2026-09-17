@@ -71,6 +71,7 @@ only**; none is serialized by `to_dict()` or written to the history meta line.
 | `_plan_stage_count` | `int` (property) | `len(_stage_titles)` |
 | `_auto_run` | `bool` | "Go All" was chosen: stage gates are skipped |
 | `_in_stage_execution` | `bool` | True only while `_stage_loop` drives a turn; gates the plan detector |
+| `_stage_delivery_consumed` | `bool` | Whether a pending stage reached the model; false makes post-login Go rerun that stage |
 
 `surface` is emitted alongside `mode` in the slots payload as a forward-compat
 alias (identical today) so a future backend can split nav destination from mode
@@ -172,7 +173,10 @@ gate is what makes the stop control actually stop the plan.
   (`{"ok": true, "queued": true}`).
 
 Typing `go` / `go all` in the chat box reaches the same loop through `api_chat`
-(`dashboard/chat_handlers.api_chat`).
+(`dashboard/chat_handlers.api_chat`). The OpenAI-compatible
+`/v1/chat/completions` path uses `slot.running` for named-slot admission, so it
+refuses unrelated requests throughout stage settlement even while no child turn
+occupies `slot.task`.
 
 **Widget-origin refusal.** `go`/`go all` is the only privilege escalation
 reachable from chat *text* (it flips the slot into unattended per-stage
@@ -248,13 +252,69 @@ entry.
    passed to `_run_chat`. An exception from `_run_chat` clears `_auto_run`,
    posts a stage-error notice, logs `auto_run_stage_error`, and breaks.
 7. **Wait for the stage's sub-agents.** Polls
-   `state.subagents.running_agents_for("dashboard:<slot>")` every 2s, up to 150
-   rounds (5 minutes), broadcasting a `chat_status` count every 10 polls. This
-   is **fail-closed**: a missing manager, or `running_agents_for` returning
-   `None` either before or during polling, stops auto-run with a notice and a
+   `state.subagents.running_agents_for(effective_session_key(slot))` every 2s.
+   The wait budget derives from the configured stage timeout and is bounded by
+   `_STAGE_SUBAGENT_POLL_ROUND_CAP`; a disabled stage timeout uses that same cap.
+   The effective key is required for a channel-born slot, whose children belong
+   to the linked `slack:*` (or other channel) session rather than
+   `dashboard:<slot>`. This is
+   **fail-closed**: a missing manager, or `running_agents_for` returning `None`
+   either before or during polling, stops auto-run with a notice and an
    `auto_run_subagent_check_failed` SEL event rather than silently skipping
-   verification. Exhausting the 150 rounds stops auto-run with
+   verification. Exhausting the cap stops auto-run with
    `auto_run_subagent_timeout`.
+
+   Agent execution ending is not the stage boundary. A terminal report marks
+   its agent done before its completion reaches the parent conversation, so an
+   empty `running_agents_for` result can coexist with report delivery still in
+   flight. The active stage `_run_chat` owns `slot.task` while that turn runs;
+   completion delivery therefore waits behind that turn rather than behind the
+   outer stage controller. While `_in_stage_execution` is set, terminal reports
+   queue their completion on the slot instead of launching a concurrent turn.
+   `_stage_loop` waits for the manager's queue-aware pending-work probe and
+   parent-scoped reports, then runs and awaits every queued completion and
+   synthetic recovery turn before it captures the stage or starts the next one.
+   Both manager methods are required capabilities; an implementation missing
+   either fails the boundary instead of silently reporting no pending work. A
+   registered report task that raises is likewise a failed delivery: the boundary
+   emits `stage_completion_delivery_failed`, pauses auto-run, and does not capture
+   or advance the stage.
+   The queue-aware probe includes accepted spawns that have not registered as
+   running agents yet, plus a completed inner run whose still-live outer task has
+   not registered its terminal report. The provider-consumption callback is
+   authoritative on every terminal path. A return before consumption preserves
+   the stage. If that turn queued an exact retry, the same controller and stage
+   guard settle it before capture; a retry restored unchanged is not redrained in
+   the same settlement and remains for the next guarded Go. Without an exact
+   successor, auto-run pauses for same-stage retry. A consumed stage interrupted
+   by Stop or hard cancellation owes an explicit continuation before capture.
+   If authentication interrupts already-consumed work, the auth-failed turn
+   records the queue id of any exact unconsumed retry it created. Go suppresses
+   the stage continuation only while that exact row remains queued; unrelated
+   completion rows do not suppress it. Queueing either recovery, and prompt
+   consumption alone, do not discharge the continuation obligation; successful
+   settlement and capture clear it. A hard Stop that discards the queued row
+   that discards the queued row therefore leaves the obligation armed, and the
+   next Go queues the recovery again before capture. The boundary remains pending
+   until recovery finishes, so it never advances directly. An uncancelled pending
+   boundary contributes to `slot.running`, blocking destructive and background
+   entry points as well as ordinary turns. Only a validated plan
+   Go/Cancel control may bypass it; rejected widget-origin Go text remains
+   ordinary input and queues. The OpenAI-compatible endpoint returns its coded
+   `slot_busy` 409 while the boundary is pending, preventing a later reply from
+   entering the stage result. A runner-authored synthesis prompt that encounters
+   authentication retains synthetic-recovery provenance rather than being
+   reclassified as a subagent completion or user row.
+   A refusal while delivering a completion requeues the system input only while it
+   remains unconsumed; output or a tool event makes replay unsafe. Completion
+   restoration trusts only the enqueue-time kind carried through the turn actor,
+   never a transcript role or content-derived classification, and a failed boundary
+   keeps that retry queued until the next guarded Go. Each boundary requires
+   two clean event-loop passes with no live child turn, running or queued agent,
+   report task, queued completion, or delivery counter; Go after authentication
+   recovery either reruns the unconsumed stage or drains and captures its pending
+   delivery before a later stage starts. Any other undelivered completion also
+   pauses auto-run instead of leaving pending stages behind a silent hand-off.
 8. **Capture the stage result**, split across the thread boundary.
    `_collect_stage_result_parts` walks the assistant messages back to this
    stage's separator **on the loop**, because `slot.messages` is live state the
@@ -365,6 +425,26 @@ land, and the point it would otherwise resume from straight into the next stage
 against a revoked approval. `_orchestration_stopped(slot, tracker)` is the single
 predicate all four gates (top-of-iteration, post-`_run_chat`, the sub-agent poll
 condition, and pre-capture) call, so the two channels cannot drift apart again.
+Slot teardown cancels and boundedly awaits both `slot.task` (the active LLM
+turn) and `_stage_controller_task` (the outer Python driver); each stage boundary
+also verifies that a controller-managed slot remains registered before advancing.
+A live stage controller counts as running for Stop and plan-action arbitration;
+Stop clears auto-run and boundedly joins the controller even between child turns.
+If Stop lands after `start_stage` but before capture, the controller records that
+stage and whether its prompt was consumed; a later Go reruns unconsumed work or
+settles consumed work instead of inferring completion from `current_stage` and
+skipping ahead. The controller snapshots `slot._stop_generation` at entry, and
+every advancement and settlement gate rejects a changed generation even after
+soft Stop has returned
+`_stop_state` to idle or a provider swallowed task cancellation. Each stage retains
+every immutable parent-session key its turns capture, so a mid-stage slot link
+cannot move settlement away from existing children or reports. A completion turn
+that fails before consumption requeues its exact system entry, and the controller
+performs its final queue arbitration after its last await. Cooperative Stop records
+the one generation authorized to restore that unconsumed entry; hard kill clears
+the authorization and discards it. Plan Cancel discards queued approvals and
+stage-delivery entries before either canceled-plan handoff, while preserving
+ordinary queued user messages for the next chat turn.
 
 The inverse — having Cancel set `slot._stopping` — is deliberately **not** what
 this does: that flag carries teardown semantics for paths outside the stage loop,

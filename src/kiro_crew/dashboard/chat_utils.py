@@ -2907,10 +2907,11 @@ AUTH_REQUIRED_KIND = "auth_required"
 SUBAGENT_COMPLETION_KIND = "subagent_completion"
 CRON_NOTIFICATION_KIND = "cron_notification"
 
+#: Queue-entry kinds whose turns must settle before an Autopilot stage advances.
+STAGE_DELIVERY_KINDS = frozenset((SUBAGENT_COMPLETION_KIND, SYNTHETIC_RECOVERY_KIND))
+
 #: All system-injection kinds (for set-membership checks).
-_SYSTEM_INJECTION_KINDS = frozenset(
-    (SUBAGENT_COMPLETION_KIND, CRON_NOTIFICATION_KIND, SYNTHETIC_RECOVERY_KIND)
-)
+_SYSTEM_INJECTION_KINDS = STAGE_DELIVERY_KINDS | frozenset((CRON_NOTIFICATION_KIND,))
 
 
 def is_synthetic_recovery_item(item: dict) -> bool:

@@ -8884,6 +8884,30 @@ class GatewayOrchestrator:
                     # is delivered. try/finally so a CancelledError can't leak it.
                     _injection_slot._subagent_deliveries_inflight += 1
                     try:
+                        if getattr(_injection_slot, "_in_stage_execution", False) is True:
+                            # The Python stage controller owns this boundary. It
+                            # waits for terminal reports, then drains completion
+                            # entries in order before capturing or advancing.
+                            # Launching here would race that capture; waiting on
+                            # slot.task can wait on the controller itself.
+                            _injection_slot.queue_append(
+                                announce,
+                                kind=SUBAGENT_COMPLETION_KIND,
+                                meta={SUBAGENT_COMPLETION_META_KEY: sub_meta},
+                            )
+                            self._defer_queued_delivery(
+                                _injection_slot,
+                                announce,
+                                info,
+                                flush_only=_flush_only,
+                            )
+                            self.dashboard_state.push_slots_update()
+                            logger.info(
+                                "Subagent %s → queued for Autopilot stage in %s",
+                                info.id,
+                                _slot_name,
+                            )
+                            return
                         if _injection_slot_busy(_injection_slot):
                             # Slot is busy (or an injection is dispatched but
                             # not yet started) — wait for that task to finish,

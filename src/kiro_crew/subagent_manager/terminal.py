@@ -315,7 +315,20 @@ class TerminalCoordinator(ManagerComponent):
 
         def _forget(t: "asyncio.Task") -> None:  # type: ignore[type-arg]
             self._manager._report_tasks.discard(t)
-            self._manager._report_owners.pop(t, None)
+            owner = self._manager._report_owners.pop(t, None)
+            if owner is None:
+                return
+            failed = t.cancelled()
+            if not failed:
+                try:
+                    failed = t.exception() is not None
+                except asyncio.CancelledError:
+                    failed = True
+            if failed:
+                parent = owner.parent_session_key
+                self._manager._report_failures[parent] = (
+                    self._manager._report_failures.get(parent, 0) + 1
+                )
 
         task.add_done_callback(_forget)
         return task

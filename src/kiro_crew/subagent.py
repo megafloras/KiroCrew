@@ -1634,6 +1634,10 @@ def _context_groups_field(info: "SubagentInfo") -> str:
     return ",".join(sorted(_context_groups_of(info)))
 
 
+class SubagentReportDeliveryError(RuntimeError):
+    """One or more registered terminal reports failed before delivery."""
+
+
 class ToolApprovalCallback(Protocol):
     async def __call__(self, event: LLMEvent, parent_session_key: str = "") -> bool:
         pass
@@ -1772,6 +1776,11 @@ class SubagentManager:
         self._followup_watchers: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         # task -> the agent whose terminal report it is delivering
         self._report_owners: dict[asyncio.Task, SubagentInfo] = {}  # type: ignore[type-arg]
+        # Parent-scoped failures consumed by ``wait_for_parent_reports``. A
+        # report can fail and leave the active-task map during the settlement
+        # poll sleep; this latch keeps that outcome observable without retaining
+        # completed Task objects indefinitely.
+        self._report_failures: dict[str, int] = {}
         self._last_spawn_ts: float = 0.0  # monotonic time of the last actual start (stagger gate)
         self.hook_store: Any = None  # Optional ScriptHookStore, set by server.py
         self._agents: dict[str, SubagentInfo] = {}
@@ -2416,6 +2425,49 @@ class SubagentManager:
         the outcome is never stranded.
         """
         await asyncio.shield(task)
+
+    async def wait_for_parent_reports(self, parent_session_key: str) -> bool:
+        """Wait until this parent's registered terminal reports finish delivery.
+
+        Returns whether at least one matching report was observed. An agent's
+        inner run can publish ``done`` before its outer task registers the report,
+        so the queue-aware pending-work probe holds that gap. Once registered,
+        active tasks live in ``_report_owners`` and failures that finish between
+        settlement polls live in ``_report_failures`` until this barrier consumes
+        them.
+        """
+        observed = False
+        while True:
+            failed = self._report_failures.pop(parent_session_key, 0)
+            if failed:
+                raise SubagentReportDeliveryError(
+                    f"{failed} registered terminal report task(s) failed"
+                )
+            reports = tuple(
+                task
+                for task, owner in self._report_owners.items()
+                if owner.parent_session_key == parent_session_key
+            )
+            if not reports:
+                return observed
+            observed = True
+            outcomes = await asyncio.gather(
+                *(asyncio.shield(task) for task in reports),
+                return_exceptions=True,
+            )
+            # The normal done callback removes every owner and latches failures.
+            # Focused tests and shutdown races may leave a completed entry here;
+            # consume it explicitly so the barrier cannot observe it twice.
+            for task in reports:
+                if task.done():
+                    self._report_owners.pop(task, None)
+            outcome_failures = sum(isinstance(outcome, BaseException) for outcome in outcomes)
+            latched_failures = self._report_failures.pop(parent_session_key, 0)
+            failed = max(outcome_failures, latched_failures)
+            if failed:
+                raise SubagentReportDeliveryError(
+                    f"{failed} registered terminal report task(s) failed"
+                )
 
     def _release_slot(self, info: SubagentInfo) -> bool:
         return self._terminal._release_slot_impl(info)
