@@ -944,7 +944,9 @@ verification does not happen. Ordering it before creation is what makes it a
 remedy rather than hygiene: the room the litter holds is charged to the same
 budgets the incoming install is measured against. It takes no lock, so the age
 window is the concurrency guard — a live probe's scratch is bounded by its own
-timeout plus fixed-timeout helpers, well inside the window.
+timeout plus fixed-timeout helpers, and the sweep only removes trees older than
+`_SCRATCH_STALE_SECS`, so a probe still within its timeout is never a sweep
+target.
 
 **The generated runner itself carries `-I` too, and for the same reason.** `python
 -c` puts the inherited cwd at `sys.path[0]`, ahead of the standard library, and
