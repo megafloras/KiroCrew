@@ -1019,3 +1019,116 @@ def test_placeholder_source_env_mirrors_the_forwarder_filters(monkeypatch) -> No
             if not (is_secret_env_key(k) or is_credential_env_key(k))
         }
     )
+
+
+# ── cmd.exe-safe launch argv (Windows quote-stripping, issue #11592) ──
+#
+# kiro-cli spawns MCP entries on Windows through ``cmd.exe /C``. A launch line
+# whose command is quoted (a ``Program Files`` interpreter) survives only
+# cmd's exactly-two-quotes special case; one more quoted element strips the
+# outer pair and the interpreter becomes ``C:\Program``. Every stub flag
+# already rides inside the base64url envelope, so the wrapped entry's
+# ``command`` is the one element that must be normalised to a metacharacter-
+# free spelling (the 8.3 short form). These tests construct the hazardous
+# input directly, so they assert the invariant on every platform.
+
+
+def _program_files_interpreter(tmp_path: Path) -> str:
+    """A real executable whose path sits under a directory with a space."""
+    exe_dir = tmp_path / "Program Files" / "Kiro Crew"
+    exe_dir.mkdir(parents=True)
+    exe = exe_dir / "python"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    return str(exe)
+
+
+def test_wrapped_argv_is_cmd_safe_under_a_spaced_interpreter_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every element of a wrapped entry's launch argv is free of cmd.exe
+    metacharacters when a short form exists for the interpreter path."""
+    exe = _program_files_interpreter(tmp_path)
+    short = exe.replace("Program Files", "PROGRA~1").replace("Kiro Crew", "KIROCR~1")
+    monkeypatch.setattr(sys, "executable", exe)
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    monkeypatch.setattr(rewriter, "_short_path_name", lambda p: short)
+
+    spec = {"name": "agent-a", "mcpServers": {"svc": {"command": exe}}}
+    new_spec, wrapped = _rewrite(spec, tmp_path, stub_servers=frozenset({"svc"}))
+    entry = new_spec["mcpServers"]["svc"]
+
+    assert wrapped == 1
+    for element in (entry["command"], *entry["args"]):
+        assert not rewriter._CMD_UNSAFE.intersection(element), element
+    assert entry["command"] == short
+
+
+def test_wrapped_command_kept_and_warned_when_no_short_form_exists(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """8.3 generation can be disabled per volume: the original path is kept
+    (same file, still launchable by non-cmd spawners) and the residual hazard
+    is logged so the failure is diagnosable instead of silent."""
+    import logging
+
+    exe = _program_files_interpreter(tmp_path)
+    monkeypatch.setattr(sys, "executable", exe)
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    monkeypatch.setattr(rewriter, "_short_path_name", lambda p: "")
+
+    spec = {"name": "agent-a", "mcpServers": {"svc": {"command": exe}}}
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.rewriter"):
+        new_spec, wrapped = _rewrite(spec, tmp_path, stub_servers=frozenset({"svc"}))
+
+    entry = new_spec["mcpServers"]["svc"]
+    assert wrapped == 1
+    assert entry["command"] == exe  # original preserved, never a broken form
+    residual = [
+        r.getMessage()
+        for r in caplog.records
+        if "metacharacter" in r.getMessage() and "'svc'" in r.getMessage()
+    ]
+    assert residual, [r.getMessage() for r in caplog.records]
+
+
+def test_short_form_still_unsafe_falls_back_to_the_original(monkeypatch) -> None:
+    """A short form that itself carries a metacharacter is not an improvement;
+    the original spelling is kept for the guard to report."""
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    monkeypatch.setattr(rewriter, "_short_path_name", lambda p: r"C:\PROGRA%1\py.exe")
+    original = r"C:\Program Files\py.exe"
+    assert rewriter._cmd_safe_command(original) == original
+
+
+def test_cmd_safe_command_is_inert_on_posix() -> None:
+    """POSIX spawns never route through cmd.exe: a spaced path is untouched."""
+    if rewriter.platform_compat.IS_WINDOWS:
+        pytest.skip("POSIX-only behaviour")
+    assert rewriter._cmd_safe_command("/opt/has space/python") == "/opt/has space/python"
+
+
+def test_already_safe_command_is_returned_unchanged(monkeypatch) -> None:
+    """A metacharacter-free path is never rewritten -- no API call, no churn in
+    the overlay bytes (the rewrite fingerprint depends on them)."""
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+
+    def _boom(path: str) -> str:
+        raise AssertionError("short-path resolution must not run for safe paths")
+
+    monkeypatch.setattr(rewriter, "_short_path_name", _boom)
+    assert rewriter._cmd_safe_command(r"C:\Python312\python.exe") == r"C:\Python312\python.exe"
+
+
+@pytest.mark.skipif(not rewriter.platform_compat.IS_WINDOWS, reason="Windows API")
+def test_short_path_name_contract_on_real_windows(tmp_path: Path) -> None:
+    """On a real Windows kernel the helper returns either '' (8.3 disabled on
+    the volume) or a spelling of the same file free of cmd metacharacters."""
+    spaced = tmp_path / "short name probe"
+    spaced.mkdir()
+    target = spaced / "probe.txt"
+    target.write_text("x")
+    got = rewriter._short_path_name(str(target))
+    if got:
+        assert os.path.exists(got)
+        assert not rewriter._CMD_UNSAFE.intersection(got)

@@ -27,6 +27,7 @@ command — falls through to the full rewrite.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import hashlib
 import json
 import logging
@@ -115,7 +116,11 @@ _FINGERPRINT_NAME = ".rewrite-fingerprint"
 # gratuitously defeat the transient-keep gate (which compares stored vs current
 # inputs) on the first upgraded boot.
 # 6: target commands and recorded probes carry their on-disk Windows casing.
-_FINGERPRINT_SCHEMA = 6
+# 7: the wrapped entry's command is normalised to a cmd.exe-safe spelling on
+# Windows (8.3 short form when the interpreter path carries a metacharacter),
+# so a kept overlay from older logic would keep launching through cmd.exe with
+# a quote-stripped interpreter path.
+_FINGERPRINT_SCHEMA = 7
 
 
 @dataclass
@@ -224,6 +229,66 @@ def _target_command_casing(path: str | None) -> str:
     if len(matches) != 1:
         return path
     return path[: -len(name)] + matches[0]
+
+
+# cmd.exe metacharacters. kiro-cli launches MCP entries on Windows through
+# ``cmd.exe /C``, which re-parses the assembled line: a quoted element beyond
+# the first trips the outer quote-stripping rule ("starts with a quote and has
+# more than two quotes -> drop the first and last"), and ``%NAME%`` spans are
+# expanded inside ANY token, quoted or not, with no escape available. An
+# element carrying one of these characters can therefore be destroyed before
+# the child ever runs. The stub's own flags already cross cmd.exe safely
+# inside the ``STUB_FLAGS_FLAG`` base64url envelope; this set exists for the
+# elements that must stay plain text on the launch line.
+_CMD_UNSAFE = frozenset(' "^%|&<>')
+
+
+def _short_path_name(path: str) -> str:  # pragma: no cover - Windows API
+    """Return *path*'s 8.3 short form via ``GetShortPathNameW``, or ``""``.
+
+    ``""`` covers every unavailable case alike: a path that does not exist,
+    a volume with 8.3 name generation disabled, or the API erroring. The
+    caller decides what unavailability means; this function never raises.
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        needed = kernel32.GetShortPathNameW(path, None, 0)
+        if not needed:
+            return ""
+        buf = ctypes.create_unicode_buffer(needed)
+        written = kernel32.GetShortPathNameW(path, buf, needed)
+        if not written or written >= needed:
+            return ""
+        return buf.value
+    except Exception:
+        return ""
+
+
+def _cmd_safe_command(path: str) -> str:
+    """Return *path* in a spelling free of cmd.exe metacharacters.
+
+    The wrapped entry's ``command`` is the one element of its launch line that
+    is not carried inside the base64url stub-flags envelope, so it alone still
+    crosses cmd.exe as plain text. Under a ``Program Files`` install the
+    interpreter path contains a space, kiro-cli quotes it, and the line then
+    survives only through cmd's exactly-two-quotes special case -- one more
+    quoted element anywhere on the line and the outer quotes are stripped,
+    turning the interpreter into ``C:\\Program``. A ``%`` in the path is worse:
+    cmd expands ``%NAME%`` spans even inside quotes. Resolving to the 8.3
+    short form (same file, no metacharacters) removes the hazard entirely.
+
+    POSIX paths and already-safe paths are returned unchanged. When no short
+    form is available (8.3 generation can be disabled per volume) the original
+    is returned and the caller's argv guard logs the residual hazard.
+    """
+    if not platform_compat.IS_WINDOWS or not path:
+        return path
+    if not _CMD_UNSAFE.intersection(path):
+        return path
+    short = _short_path_name(path)
+    if short and not _CMD_UNSAFE.intersection(short):
+        return short
+    return path
 
 
 def _resolve_target_command(
@@ -606,7 +671,11 @@ def _build_stub_entry(
     }
     wrapped.update({
         _WRAPPER_MARKER: True,
-        "command": sys.executable,
+        # _cmd_safe_command: the interpreter path is the ONE launch-line
+        # element outside the stub-flags envelope, and under a
+        # ``Program Files`` install it carries the space that makes cmd.exe
+        # quote-stripping reachable (see the helper's docstring).
+        "command": _cmd_safe_command(sys.executable),
         # ``-m kiro_crew.mcp_gateway.stub`` leads; the stub's own flags follow
         # as ONE encoded envelope. Every value above is raw operator or
         # filesystem text -- the executable path, the work dir, the socket, the
@@ -636,6 +705,20 @@ def _build_stub_entry(
         "env": {},
     })
     if platform_compat.IS_WINDOWS:
+        # Diagnosable, not silent: 8.3 short-name generation can be disabled
+        # per volume, in which case _cmd_safe_command had nothing safe to
+        # return and the hazard is still on the line. Name the server and the
+        # element so an operator reading the log can connect it to the
+        # "connection closed: initialize response" the session will show.
+        for element in (wrapped["command"], *wrapped["args"]):
+            residual = _CMD_UNSAFE.intersection(element)
+            if residual:
+                logger.warning(
+                    "rewriter: server %r launch argv element %r carries cmd.exe "
+                    "metacharacter(s) %s after normalisation; a CLI that spawns "
+                    "MCP servers through cmd.exe may fail to launch this stub",
+                    server_name, element, "".join(sorted(residual)),
+                )
         command_line = subprocess.list2cmdline([wrapped["command"], *wrapped["args"]])
         command_units = len(command_line.encode("utf-16-le")) // 2
         if command_units >= _WINDOWS_CMD_LINE_LIMIT:
