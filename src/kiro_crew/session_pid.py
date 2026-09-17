@@ -9,6 +9,7 @@ See ``session.py`` module docstring for the full Process Sweep Architecture.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import signal
@@ -2649,8 +2650,8 @@ _REAPABLE_PID_FIELD: tuple[tuple[str, int], ...] = (
 )
 
 
-def _tracked_agent_pids() -> set[int]:
-    """PIDs a reaper can terminate, per both tracking files.
+def _read_tracked_agent_pids() -> tuple[set[int], bool]:
+    """Return the tracked PID snapshot and whether it is complete.
 
     Both files are read because a runtime absent from BOTH is exactly what
     :func:`_is_untracked_managed_agent_orphan` reports, and each reaper keys off
@@ -2659,32 +2660,46 @@ def _tracked_agent_pids() -> set[int]:
     session entry's third field is a start-time identity, numeric on Linux, and
     is never read as a PID.
 
-    Deliberately read WITHOUT either file lock. Readers cannot tear: rewrites
+    Reads remain lock-free. Readers cannot tear: rewrites
     go through :func:`_rewrite_pid_file` (temp file + rename, so a reader sees
     either the whole old or the whole new content) and tracking appends are
-    single short lines. Locking here would put a lock acquisition inside the
-    sweep's per-scan path for a purely diagnostic read. Any read failure yields
-    the entries found so far — the detector is report-only, so the worst
-    outcome is one spurious or one missing log line, never a kill.
+    single short lines. ``complete`` is false whenever a potential PID could
+    have been dropped; a missing file is a complete empty contribution.
     """
     tracked: set[int] = set()
+    complete = True
     paths = (_session_pid_file_path(), _pid_file_path())
     for path, (_label, reapable_index) in zip(paths, _REAPABLE_PID_FIELD):
         try:
             raw = path.read_text(encoding="utf-8")
-        except OSError:
-            continue  # absent or unreadable — nothing this file can claim
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                complete = False
+            continue
         for line in raw.split():
             fields = line.split(":")
             index = 0 if len(fields) == 1 else reapable_index
             if index >= len(fields):
-                continue  # truncated entry — no reapable field to read
+                complete = False
+                continue
             try:
                 value = int(fields[index])
             except ValueError:
-                continue  # malformed or partially-appended line
+                complete = False
+                continue
             if value > 0:
                 tracked.add(value)
+    return tracked, complete
+
+
+def _tracked_agent_pids() -> set[int]:
+    """PIDs a reaper can terminate, preserving report-only fail-open behavior.
+
+    Diagnostic callers intentionally accept a partial set. Any caller that can
+    authorize a kill must use :func:`_read_tracked_agent_pids` and require its
+    completeness flag.
+    """
+    tracked, _complete = _read_tracked_agent_pids()
     return tracked
 
 
