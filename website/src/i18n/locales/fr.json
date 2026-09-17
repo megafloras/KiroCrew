@@ -14129,6 +14129,7 @@
         "file_delivery_armed_expired": "Cette demande a expiré avant d’être approuvée. Autorisez à nouveau la livraison pour recommencer.",
         "file_delivery_since": "Depuis {{time}}",
         "file_delivery_confirm": "Confirmer",
+        "file_delivery_confirm_help": "Ceci démarre une demande que vous finalisez dans un terminal sur cette machine — rien n'est livré avant cela, et vous pouvez la retirer à tout moment.",
         "file_delivery_withdraw": "Retirer",
         "file_delivery_never_grantable": "Les envois vers Slack ou un canal de discussion ne peuvent jamais etre autorises ici et ne sont pas proposes : une autorisation ne peut jamais couvrir une destination qu'un tiers peut voir.",
         "file_delivery_load_failed": "Impossible de lire quelles destinations sont confirmées.",

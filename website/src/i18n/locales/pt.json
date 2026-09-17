@@ -14128,6 +14128,7 @@
         "file_delivery_armed_expired": "Essa solicitação expirou antes de ser aprovada. Permita a entrega novamente para recomeçar.",
         "file_delivery_since": "Desde {{time}}",
         "file_delivery_confirm": "Confirmar",
+        "file_delivery_confirm_help": "Isto inicia um pedido que você conclui num terminal nesta máquina — nada é entregue até lá, e você pode retirá-lo a qualquer momento.",
         "file_delivery_withdraw": "Retirar",
         "file_delivery_never_grantable": "Envios para o Slack ou para um canal de chat nunca podem ser permitidos aqui e nao sao oferecidos: uma permissao nunca pode cobrir um destino que um terceiro possa ver.",
         "file_delivery_load_failed": "Não foi possível ler quais destinos estão confirmados.",

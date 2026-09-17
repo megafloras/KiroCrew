@@ -14129,6 +14129,7 @@
         "file_delivery_armed_expired": "Esa solicitud caducó antes de aprobarse. Vuelve a permitir la entrega para empezar de nuevo.",
         "file_delivery_since": "Desde {{time}}",
         "file_delivery_confirm": "Confirmar",
+        "file_delivery_confirm_help": "Esto inicia una solicitud que completas en una terminal de este equipo — hasta entonces no se entrega nada, y puedes retirarla en cualquier momento.",
         "file_delivery_withdraw": "Retirar",
         "file_delivery_never_grantable": "Las subidas a Slack o a un canal de chat nunca pueden permitirse aqui y no se ofrecen: un permiso nunca puede cubrir un destino que un tercero pueda ver.",
         "file_delivery_load_failed": "No se pudo leer qué destinos están confirmados.",

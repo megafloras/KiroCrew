@@ -13762,6 +13762,7 @@
         "file_delivery_armed_expired": "このリクエストは承認される前に期限切れになりました。もう一度配信を許可してやり直してください。",
         "file_delivery_since": "{{time}} から",
         "file_delivery_confirm": "確認する",
+        "file_delivery_confirm_help": "これはリクエストを開始します。このマシンのターミナルで完了させてください—それまで何も送信されず、いつでも取り消せます。",
         "file_delivery_withdraw": "取り消す",
         "file_delivery_never_grantable": "Slack やチャットチャンネルへのアップロードはここでは決して許可できず、表示もされません。許可が第三者から見える宛先を対象にすることは決してありません。",
         "file_delivery_load_failed": "どの宛先が確認済みかを読み取れませんでした。",

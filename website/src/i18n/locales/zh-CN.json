@@ -13762,6 +13762,7 @@
         "file_delivery_armed_expired": "该请求在获批前已过期。请再次允许传送以重新开始。",
         "file_delivery_since": "自 {{time}} 起",
         "file_delivery_confirm": "确认",
+        "file_delivery_confirm_help": "这会发起一个请求，你需要在本机的终端中完成它——在那之前不会投递任何内容，而且你可以随时撤销。",
         "file_delivery_withdraw": "撤回",
         "file_delivery_never_grantable": "向 Slack 或聊天频道的上传在此永远无法被允许，也不会提供：允许永远不能覆盖第三方可见的目标。",
         "file_delivery_load_failed": "无法读取哪些目标已确认。",

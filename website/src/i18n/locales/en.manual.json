@@ -5929,6 +5929,7 @@
         "file_delivery_armed_expired": "That request expired before it was approved. Allow delivery again to start over.",
         "file_delivery_since": "Since {{time}}",
         "file_delivery_confirm": "Allow delivery",
+        "file_delivery_confirm_help": "This starts a request you finish in a terminal on this machine — nothing is delivered until then, and you can withdraw it at any time.",
         "file_delivery_armed_help": "One more step, on this machine: run this command in a terminal on the computer running {{productName}} to finish allowing delivery. This confirms a person is at the machine — a browser session alone cannot allow it.",
         "file_delivery_armed_expires": "This request expires in about {{duration}}.",
         "file_delivery_withdraw": "Withdraw",

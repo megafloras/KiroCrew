@@ -1019,6 +1019,17 @@ function FileDeliveryConsentCard() {
                     )}
               </div>
 
+              {/* Resting state, before any click: the primary button reads
+                  "Allow delivery", which a blind reader takes as an immediate,
+                  irreversible grant. It is neither — the click only ARMS a
+                  reversible two-step request that delivers nothing until the
+                  host command runs. Say so at the point of consent. */}
+              {!held && !isArmedForThis && (
+                <div className="text-[11px] text-muted mt-0.5 leading-relaxed">
+                  {i18nT('pages.settings.securityPanel.file_delivery_confirm_help')}
+                </div>
+              )}
+
               {/* Armed but not yet approved: the grant is deliberately NOT
                   recorded by the click. Show the exact host command that
                   finishes it, because that step-up is what stops an

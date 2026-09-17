@@ -14128,6 +14128,7 @@
         "file_delivery_armed_expired": "Questa richiesta è scaduta prima dell’approvazione. Consenti di nuovo la consegna per ricominciare.",
         "file_delivery_since": "Dal {{time}}",
         "file_delivery_confirm": "Conferma",
+        "file_delivery_confirm_help": "Questo avvia una richiesta che completi in un terminale su questo computer — fino ad allora non viene consegnato nulla e puoi ritirarla in qualsiasi momento.",
         "file_delivery_withdraw": "Revoca",
         "file_delivery_never_grantable": "I caricamenti su Slack o su un canale di chat non possono mai essere consentiti qui e non vengono proposti: un consenso non può mai coprire una destinazione visibile a terzi.",
         "file_delivery_load_failed": "Non è stato possibile leggere quali destinazioni sono confermate.",

@@ -13945,6 +13945,7 @@
         "file_delivery_armed_expired": "Diese Anfrage ist abgelaufen, bevor sie freigegeben wurde. Erlaube die Zustellung erneut, um von vorn zu beginnen.",
         "file_delivery_since": "Seit {{time}}",
         "file_delivery_confirm": "Bestätigen",
+        "file_delivery_confirm_help": "Damit startet eine Anfrage, die du in einem Terminal auf diesem Computer abschließt — bis dahin wird nichts zugestellt, und du kannst sie jederzeit zurücknehmen.",
         "file_delivery_withdraw": "Zurückziehen",
         "file_delivery_never_grantable": "Uploads an Slack oder einen Chat-Kanal koennen hier niemals erlaubt werden und werden nicht angeboten: Eine Erlaubnis kann niemals ein Ziel abdecken, das ein Dritter sehen kann.",
         "file_delivery_load_failed": "Es konnte nicht gelesen werden, welche Ziele bestätigt sind.",
