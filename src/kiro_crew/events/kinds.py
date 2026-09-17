@@ -8,8 +8,8 @@ that arrives with no constructor does not belong here.
 
 Facts that need ORDER, threading or citation are not this track's to name. The
 decision of record is ``docs/request-for-change/rfc-append-only-ledger.md``: they
-go to the per-unit append-only ledger, whose writer assigns a per-unit ``seq``,
-and turn boundaries are the first of them -- ``kiro_crew.session_ledger_emit``
+go to the per-unit append-only crew log, whose writer assigns a per-unit ``seq``,
+and turn boundaries are the first of them -- ``kiro_crew.crew_log.emit``
 writes them there. So a kind for such a fact is not merely un-emitted here, it
 belongs to the other stream. What remains for this track is unsequenced facts
 whose emitters land with them; additive-only evolution makes that free, and

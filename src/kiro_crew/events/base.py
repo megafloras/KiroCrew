@@ -30,14 +30,14 @@ Schema contract (v1):
   the axis consumers will fold on, so it needs a defined scope (per writer? per
   key? global?) and a writer that assigns it. The decision of record is
   ``docs/request-for-change/rfc-append-only-ledger.md``: the per-unit append-only
-  ledger is the stream for facts that need ordering, threading or citation, and
+  crew log is the stream for facts that need ordering, threading or citation, and
   its ``seq`` is scoped PER UNIT and assigned by the single writer of that unit's
   file -- a scope a day-sharded, multi-domain shard cannot give itself, which is
-  why it lives there and not here. That ledger's envelope is field-compatible
+  why it lives there and not here. That crew log's envelope is field-compatible
   with this one -- its ``type`` is this ``kind``, its ``time`` is this ``ts_ms`` --
   so one projection folds both with a field rename and no semantic translation.
   ``ts_ms`` carries an unsequenced event's own time. The storage contract is
-  ``docs/system-specs/modules/ledger-core.md``.
+  ``docs/system-specs/modules/crew-log-core.md``.
 - Evolution is **additive only**: new kinds, new optional ``data`` fields, and
   new optional ENVELOPE keys may be added; existing fields are never renamed or
   repurposed. ``v`` exists as the escape hatch for a future incompatible break,

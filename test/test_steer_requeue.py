@@ -239,7 +239,7 @@ class TestSteerConsumedClears:
         This guards the decision rather than the mechanism: re-adding an emit at
         either site without a resolver that owns both facts reddens this test.
         """
-        from kiro_crew import session_ledger_emit
+        from kiro_crew.crew_log import emit as crew_log_emit
         from kiro_crew.dashboard.chat_runner import _settle_consumed_steers
 
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
@@ -250,10 +250,8 @@ class TestSteerConsumedClears:
         slot._acp_client = MagicMock()
 
         seen: list[int] = []
-        monkeypatch.setattr(session_ledger_emit, "session_id_of", lambda _c: "acp-1")
-        monkeypatch.setattr(
-            session_ledger_emit, "on_message_steered", lambda *a, **kw: seen.append(1)
-        )
+        monkeypatch.setattr(crew_log_emit, "session_id_of", lambda _c: "acp-1")
+        monkeypatch.setattr(crew_log_emit, "on_message_steered", lambda *a, **kw: seen.append(1))
 
         _settle_consumed_steers(slot, "<user_message>\nfix the bug\n</user_message>", state)
 

@@ -11,8 +11,8 @@ on-disk store for THIS envelope (writer, watermark reader, retention) waits for
 an unsequenced fact whose emitter needs it; the additive-only rule makes adding
 it later free. It is not where an ordered fact goes: the decision of record is
 ``docs/request-for-change/rfc-append-only-ledger.md``, which puts facts needing
-order, threading or citation on the per-unit append-only ledger in
-:mod:`kiro_crew.ledger`, with a writer that assigns a per-unit ``seq``. That envelope is field-compatible with this one -- ``type`` for
+order, threading or citation on the per-unit append-only crew log in
+:mod:`kiro_crew.crew_log`, with a writer that assigns a per-unit ``seq``. That envelope is field-compatible with this one -- ``type`` for
 ``kind``, ``time`` for ``ts_ms`` -- so one projection folds both with a field
 rename. Nothing here modifies an existing store; see base.py's module docstring
 for the schema contract.
