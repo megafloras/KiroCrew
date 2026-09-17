@@ -340,7 +340,9 @@ def test_a_failed_fetch_is_an_environment_error_not_a_green(mod, monkeypatch, pa
 # --- the flags ---------------------------------------------------------------
 
 
-def test_the_tested_base_is_the_merge_base_not_a_caller_supplied_sha(mod, monkeypatch, pair, capsys) -> None:
+def test_the_tested_base_is_the_merge_base_not_a_caller_supplied_sha(
+    mod, monkeypatch, pair, capsys
+) -> None:
     """The commit the green was measured on is inferred, never passed in.
 
     prepare-pr rebases before every push, so merge-base(HEAD, origin/base) IS
