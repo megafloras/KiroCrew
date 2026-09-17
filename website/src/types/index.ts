@@ -1491,6 +1491,11 @@ export interface PublishProviderDescriptor {
    *  available. Optional: older gateways omit it, and a row with no hint simply shows
    *  none rather than inventing one. */
   install_hint?: string
+  /** False => the published link requires authentication (content is stored privately),
+   *  so the publish flow shows neither the public-exposure warning nor the "publish
+   *  publicly" acknowledgment. Optional: older gateways omit it, and absence means
+   *  reachable -- a missing warning on a public link is the worse mistake. */
+  public_reachable?: boolean
   sharing_model: {
     supports_private: boolean
     supports_shared: boolean
