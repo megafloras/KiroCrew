@@ -1217,22 +1217,27 @@ def test_member_history_tools_cannot_cross_private_store(
         "api_session_control_read",
     ],
 )
-async def test_ordinary_private_caller_cannot_reach_owner_via_session_control(
+async def test_private_member_store_caller_cannot_reach_owner_via_session_control(
     env, member_proof, handler_name
 ):
-    """A private V2 caller that is NOT a crew-member DM slot stays refused on all
-    five routes.
+    """A caller bound to a crew member's V2 store cannot reach the OWNER's
+    sessions through any of the five routes.
 
-    This is the narrowed residual of the former blanket refusal. The caller here
-    is ``dashboard:alice`` — a verified V2 caller, but NOT a ``member-*`` DM slot
-    — so it must not reach ``dashboard:owner`` (an unbound/owner session) or
-    borrow Global V1 memory by creating a session on the ``default`` agent. The
-    ``member_scope_denied`` refusal in ``_require_internal`` still fires for it,
-    because the member admission is keyed on the ``member-*`` session key.
+    ``dashboard:alice`` is bound to ``member-alice`` — a crew member's private V2
+    store — so under case (b) it is now a MEMBER caller and IS admitted through
+    ``_require_internal``'s gate (the member operating model runs from an
+    ordinary chat slot too, not only a ``member-*`` DM slot). The protection of
+    the owner therefore moves DOWN to the inner fence in
+    ``session_control.py``, and it must still hold: reaching ``dashboard:owner``
+    (a session this caller did not create) or borrowing Global V1 memory by
+    creating on the ``default`` agent is refused there, never at a 2xx.
 
-    A genuine crew-member DM slot IS admitted through this gate now (the member
-    operating model); that path, and the ownership fence that bounds it, are
-    covered by ``test_session_control_member_gate`` and
+    The refusal is a FENCE refusal (caller-ownership / delegation), NOT the
+    gate's ``member_scope_denied`` — that code does not fire for a member-store
+    caller, which is the behaviour this row pins. A genuinely
+    non-member private caller (a V2 store with no ``owner_member``) still gets
+    ``member_scope_denied``; that, and the member admission path with its
+    ownership fence, are covered in ``test_session_control_member_gate`` and
     ``test_member_session_control``.
     """
     from kiro_crew.dashboard.handlers import session_control
@@ -1245,8 +1250,22 @@ async def test_ordinary_private_caller_cannot_reach_owner_via_session_control(
             proof=member_proof,
         )
     )
-    assert response.status == 403
-    assert json.loads(response.text)["code"] == "member_scope_denied"
+    # Never admitted to act on the owner: an error status, and never the owner's
+    # own session in a success payload.
+    assert response.status in (400, 403, 404, 409), response.text
+    code = json.loads(response.text)["code"]
+    # The owner is protected by the fence, not the gate: a member-store caller
+    # gets past the gate, so this must be a fence/delegation refusal.
+    assert code != "member_scope_denied", response.text
+    assert code in {
+        "caller_unidentified",
+        "not_creator",
+        "caller_not_open",
+        "agent_store_mismatch",
+        "target_not_found",
+        "target_required",
+        "message_required",
+    }, response.text
 
 
 def test_forged_mcp_caller_without_proof_cannot_read_private_history(env, monkeypatch):

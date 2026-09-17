@@ -145,7 +145,7 @@ that is out of bounds is visible after the fact even though nothing happened.
 
 | Refusal | Status | Why |
 |---------|--------|-----|
-| Config switch off (`agent.session_control` explicitly `false`) | 403 | Operator withdrew the capability from every agent at once. Defaults to true — the agent's `kirocrew-dashboard` mount is the grant. **Exception:** a crew-member DM slot (`member-*` caller key) bypasses this switch while `agent.member_dispatch` is true (its default) — see "Member callers" below |
+| Config switch off (`agent.session_control` explicitly `false`) | 403 | Operator withdrew the capability from every agent at once. Defaults to true — the agent's `kirocrew-dashboard` mount is the grant. **Exception:** a crew member bypasses this switch while `agent.member_dispatch` is true (its default) — recognised either as a `member-*` DM caller key OR as a chat slot bound to that member's private V2 store; see "Member callers" below |
 | Caller session cannot be identified | 403 | An unidentifiable caller makes the self-target guard blind |
 | Caller is an unattended session (`workflow-*`) | 403 | A `workflow-<run_id>` slot exists only once its originating tab is gone, so there is no owning session to fence it to. **Exception:** a cron slot (`cron-*` caller key) is admitted and fenced by creator ownership instead — see "Cron callers" below |
 | Caller is itself incognito, temporary, or app-scoped | 403 | Caller-side isolation — the direction the target-side checks cannot see |
@@ -168,10 +168,30 @@ that is out of bounds is visible after the fact even though nothing happened.
 
 ### Member callers: switch bypass, bounded by creator ownership
 
-A crew member's pinned DM slot (caller key prefixed `member-`, created only by
-`POST /api/members/{slug}/thread`) is a **conductor by design**: it dispatches
-work into worker sessions it creates, patrols them, and reports back, with no
-operator configuration. Two rules give it that shape:
+A crew member is a **conductor by design**: it dispatches work into worker
+sessions it creates, patrols them, and reports back, with no operator
+configuration. A member runs in TWO kinds of slot, and both are that operating
+model rather than an optional capability, so both are recognised as a member
+caller (`_member_caller`, the single predicate the switch bypass and the
+ownership fence both read):
+
+- **(a) its pinned DM slot** (caller key prefixed `member-`, created only by
+  `POST /api/members/{slug}/thread`); and
+- **(b) an ORDINARY dashboard chat slot** (`chat-<n>-<ts>`) whose bound memory
+  store is that member's private V2 store — the store a DM slot would be bound
+  to. A member agent (e.g. `kirocrew-conductor`) also runs in an ordinary chat
+  slot bound to its V2 store, and its whole operating model (`session_create` /
+  `session_send` / `session_read_message` / `session_stop` / `session_close`)
+  runs from there, so refusing it in a chat slot would leave the member
+  chat-only in the surface it exists to drive. The identity here is the STORE,
+  not the key: a store counts iff its config record carries a non-empty
+  `owner_member` AND `memory_version == 2` (`_store_is_member_owned`, read from
+  the loaded config record — never the on-disk manifest, which would be blocking
+  IO at the synchronous fence — and **failing closed** on an unreadable or
+  degraded `memory_stores` section). Admission never widens to a private V2
+  caller whose store is not a crew member's.
+
+Two rules give a member caller its shape:
 
 - **The `agent.session_control` switch does not gate a member caller.** Members
   work out of the box — this is the zero-configuration contract, and it is a
@@ -191,12 +211,14 @@ operator configuration. Two rules give it that shape:
   `authorize_target` refuses a member caller whose key does not match the
   target's `created_by` (`not_creator`, 403) — and this ownership boundary binds
   **even when the global switch is enabled**, so a member never widens to the
-  ordinary caller's reach. Every other refusal in the table above still applies
-  to member callers unchanged.
+  ordinary caller's reach. It binds identically for case (b): the chat-slot
+  member is fenced to the workers it created, never the user's own sessions.
+  Every other refusal in the table above still applies to member callers
+  unchanged.
 
 Ordinary (non-member) callers are untouched: they still require the switch.
 
-#### The strict-internal surface admits a member DM slot, not any private caller
+#### The strict-internal surface admits a crew member, not any private caller
 
 The five routes sit behind `_require_internal`, which first refuses anything
 without a valid `X-Internal-Secret`, and then — on the authenticated branch —
@@ -205,24 +227,30 @@ caller's private authority ONCE (`internal_memory_scope`) and decides:
 
 - an **owner / Global-V1 caller** (no private scope) falls through to the handler,
   exactly as the surface behaved before member dispatch existed;
-- a **crew-member DM slot** (a `member-*` session key) is ADMITTED while the
-  surface is reachable for it — `agent.member_dispatch` OR the global
-  `agent.session_control` switch — so its request reaches `session_control.py`
-  where the creator-ownership fence above does the real gating;
-- **every other verified private V2 caller** — an ordinary private member, or a
-  member while BOTH switches are off — keeps the `member_scope_denied` 403;
+- a **crew member** is ADMITTED while the surface is reachable for it —
+  `agent.member_dispatch` OR the global `agent.session_control` switch — so its
+  request reaches `session_control.py` where the creator-ownership fence above
+  does the real gating. A crew member is recognised here in the SAME two
+  spellings the inner fence uses: (a) a `member-*` session key, OR (b) a chat
+  slot whose bound store (the `scope` `internal_memory_scope` just resolved) is a
+  crew member's V2 store, confirmed by the same `_store_is_member_owned`
+  config-record predicate — so the gate and the fence cannot disagree on what a
+  member is;
+- **every other verified private V2 caller** — one whose store is NOT a crew
+  member's, or a member while BOTH switches are off — keeps the
+  `member_scope_denied` 403;
 - an **unverifiable caller** keeps the `member_session_unverified` 403.
 
 The gate reads the SAME two switches the switch gate does — `member_dispatch` is
 a bypass ON TOP of `session_control`, not a replacement, so a member with
 `member_dispatch` off falls back UNDER the global switch rather than out of a
-surface the operator left open to everyone. Both reads fail closed on an
+surface the operator left open to everyone. All reads fail closed on an
 unreadable config, so the surface can never open wider than the two switches
 behind it. This gate replaced a blanket refusal that returned `member_scope_denied`
 to every verified V2 caller — which made the member operating model unreachable
 even though `session_control.py` already carried the member fence. The refusal for
-a non-member private caller is unchanged; only the member DM slot's admission is
-new.
+a genuinely non-member private caller is unchanged; the member admission — for a
+DM slot AND for a chat slot bound to a member store — is new.
 
 #### A member-created worker stays inside its own private memory
 

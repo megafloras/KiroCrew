@@ -123,23 +123,91 @@ CRON_LINK_PREFIX = "cron:"
 APP_CRON_OWNER_PREFIX = "app:"
 
 
-def _member_caller(caller_key: str) -> bool:
-    """Whether *caller_key* is a crew member's pinned DM slot.
+def _member_caller(state: "DashboardState", caller_key: str) -> bool:
+    """Whether *caller_key* is a crew member acting through one of its slots.
 
-    A member DM session dispatches its real work into worker sessions it
-    creates and patrols — that is the member operating model, not an optional
-    capability — so the surface authorizes it WITHOUT the global
-    ``agent.session_control`` opt-in. What bounds it instead is ownership:
-    :func:`authorize_target` restricts a member caller to slots it created
-    itself, so the automatic grant never reaches the user's own sessions.
+    A crew member runs in TWO kinds of slot, and both are the member operating
+    model rather than an optional capability, so the surface authorizes either
+    WITHOUT the global ``agent.session_control`` opt-in. What bounds them
+    instead is ownership: :func:`authorize_target` restricts a member caller to
+    slots it created itself, so the automatic grant never reaches the user's
+    own sessions.
 
-    Spelled through the members module's own prefix constant (imported
-    lazily — members imports validation which sits below this module in the
-    layering) rather than a restated literal, so the two cannot drift.
+    * (a) a pinned DM slot, keyed ``member-<slug>`` — recognised by the members
+      module's own prefix constant (imported lazily, since ``members`` imports
+      ``validation`` which sits below this module in the layering) rather than a
+      restated literal, so the two cannot drift; and
+    * (b) an ORDINARY dashboard chat slot (``chat-<n>-<ts>``) whose bound memory
+      store is that member's private V2 store — the same store a DM slot would
+      be bound to. A member's whole operating model (``session_create`` /
+      ``session_send`` / ``session_read_message`` / ``session_stop`` /
+      ``session_close``) also runs from such a chat slot, so refusing it there
+      would leave the member chat-only in the surface it exists to drive. The
+      store, not the key, is the member's identity here: it is what
+      :func:`_store_is_member_owned` reads off the config record.
+
+    Case (b) needs the caller's slot to read its bound store, hence *state*;
+    ``member_dispatch`` gates the bypass either way (:func:`_member_bypass`).
     """
     from kiro_crew.members import DM_SLOT_KEY_PREFIX
 
-    return caller_key.startswith(DM_SLOT_KEY_PREFIX)
+    if caller_key.startswith(DM_SLOT_KEY_PREFIX):
+        return True
+    slot = state.get_slot(caller_key)
+    if slot is None:
+        return False
+    return _store_is_member_owned(getattr(slot, "memory_store", "") or "")
+
+
+def _store_is_member_owned(store: str) -> bool:
+    """Whether *store* is a crew member's private V2 memory store.
+
+    The ONE predicate that answers "is this store a member's store" for both the
+    inner fence here (:func:`_member_caller` case (b)) and the HTTP gate
+    (``handlers/session_control.py``'s ``_private_caller_refusal``), so the two
+    layers cannot disagree on what a member store is.
+
+    Read from the CONFIG RECORD (``owner_member`` set AND ``memory_version ==
+    2``), never from the on-disk ownership manifest: this runs at
+    :func:`authorize_target`'s synchronous fence, where a manifest ``stat`` /
+    ``read`` would be blocking IO on the event loop. ``KiroCrewConfig.load()`` is
+    the cached read the switch gate beside it already performs (warmed by
+    :func:`prewarm_enabled_check`), and ``owner_member`` / ``memory_version`` are
+    in-memory fields on the loaded record — no file is touched here. This mirrors
+    ``active_member_memory_stores``' own record test, so a store counts as a
+    member store in exactly one way.
+
+    Fails CLOSED, the same direction :func:`session_control_enabled` and
+    :func:`member_dispatch_enabled` do: a config read that RAISES, or a config
+    that LOADS but discarded ``memory_stores`` (or the whole file), resolves to
+    ``False``. Withdrawing the case-(b) admission on unreadable config can never
+    open the surface wider than it is — a member falls back under the global
+    switch — while trusting a degraded default could silently admit a caller
+    whose store record was coerced away.
+    """
+    if not store or store == "default":
+        return False
+    try:
+        cfg = KiroCrewConfig.load()
+    except Exception:
+        logger.warning(
+            "session_control: config read failed — treating store %r as non-member until "
+            "config loads",
+            store,
+            exc_info=True,
+        )
+        return False
+    if cfg.degraded_sections & {DEGRADED_WHOLE_CONFIG, "memory_stores"}:
+        logger.warning(
+            "session_control: memory_stores config section degraded — treating store %r as "
+            "non-member",
+            store,
+        )
+        return False
+    record = cfg.memory_stores.get(store)
+    if record is None:
+        return False
+    return bool(getattr(record, "owner_member", "")) and getattr(record, "memory_version", 1) == 2
 
 
 def _cron_caller(caller_key: str) -> bool:
@@ -198,7 +266,7 @@ def _caller_is_ownership_fenced(state: "DashboardState", caller_key: str) -> boo
     this session", not "is a person at the keyboard", so a person working in an
     agent-created session keeps that session's reach rather than their own.
     """
-    if _member_caller(caller_key) or _cron_caller(caller_key):
+    if _member_caller(state, caller_key) or _cron_caller(caller_key):
         return True
     slot = state.get_slot(caller_key)
     if slot is None:
@@ -402,7 +470,7 @@ def member_dispatch_enabled() -> bool:
     return bool(cfg.agent.member_dispatch)
 
 
-def _member_bypass(caller_key: str) -> bool:
+def _member_bypass(state: "DashboardState", caller_key: str) -> bool:
     """Whether *caller_key* may skip the ``session_control`` switch as a member.
 
     The single expression both switch gates key on, extracted rather than
@@ -412,12 +480,13 @@ def _member_bypass(caller_key: str) -> bool:
     turned off, the member is no longer exempt and the switch gate applies to
     it like any other caller.
 
-    Keyed on the immutable slot-key prefix (via :func:`_member_caller`) AND the
-    config ceiling — the two together decide the bypass, and neither is a proxy
-    for it. ``member_dispatch_enabled`` is read at the gate, synchronously,
-    right before the act, exactly as ``session_control_enabled`` is beside it.
+    Keyed on :func:`_member_caller` (a ``member-`` DM slot OR a chat slot bound
+    to a member's V2 store — hence *state*) AND the config ceiling: the two
+    together decide the bypass, and neither is a proxy for it.
+    ``member_dispatch_enabled`` is read at the gate, synchronously, right before
+    the act, exactly as ``session_control_enabled`` is beside it.
     """
-    return _member_caller(caller_key) and member_dispatch_enabled()
+    return _member_caller(state, caller_key) and member_dispatch_enabled()
 
 
 async def prewarm_enabled_check() -> None:
@@ -949,7 +1018,7 @@ async def create_session(
     # switch like any other caller. Every other caller still needs the switch.
     # The member's automatic grant is bounded by ownership in `authorize_target`,
     # not here: creation makes the caller the owner by construction.
-    if not session_control_enabled() and not _member_bypass(caller_key):
+    if not session_control_enabled() and not _member_bypass(state, caller_key):
         raise SessionControlError(
             "session control is disabled in config (agent.session_control)",
             code="session_control_disabled",
@@ -1609,7 +1678,11 @@ def authorize_target(
     # (default true = today's behaviour) is on. Turn that ceiling off and the
     # member falls back under the switch. The member's reach stays bounded by
     # the ownership check below, which restricts it to slots it created itself.
-    if not skip_enabled_check and not session_control_enabled() and not _member_bypass(caller_key):
+    if (
+        not skip_enabled_check
+        and not session_control_enabled()
+        and not _member_bypass(state, caller_key)
+    ):
         raise deny(
             "session control is disabled in config (agent.session_control)",
             "session_control_disabled",
@@ -1737,7 +1810,7 @@ def authorize_target(
         # which is what an ownerless rehydrate looks like.
         if _cron_caller(caller_key):
             fence_reason = "a scheduled run can only control sessions it created itself"
-        elif _member_caller(caller_key):
+        elif _member_caller(state, caller_key):
             fence_reason = "a crew member can only control worker sessions it created itself"
         else:
             fence_reason = "an agent-created session can only control sessions it created itself"
