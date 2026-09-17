@@ -290,3 +290,27 @@ class TestExport:
         assert not hasattr(security, "redact_paths_distinct")
         assert "redact_paths_distinct" not in _exports.EXPORTED_NAMES
         assert not hasattr(redaction_mod, "redact_paths_distinct")
+
+
+class TestLocalPathRootAnchors:
+    """``redact_local_paths`` anchors to real filesystem roots. The set must
+    include the ``/local/home`` layout used by some Linux dev hosts, whose home
+    directory does NOT sit under ``/home`` -- without it a checkout path there
+    leaks the operator's login through any egress surface."""
+
+    def test_local_home_dev_host_path_is_redacted(self) -> None:
+        red, notes = redaction_mod.redact_local_paths("/local/home/somelogin/.kirocrew/workspace")
+        assert red == "[redacted-path]"
+        assert notes
+
+    def test_the_classic_home_root_still_redacts(self) -> None:
+        assert redaction_mod.redact_local_paths("/home/somelogin/x")[0] == "[redacted-path]"
+
+    def test_a_url_is_not_mistaken_for_a_path(self) -> None:
+        url = "https://api.github.com/repos/x"
+        assert redaction_mod.redact_local_paths(url)[0] == url
+
+    def test_local_prefix_that_is_not_local_home_is_left_alone(self) -> None:
+        # The anchor is ``/local/home`` specifically, not a bare ``/local`` --
+        # a directory like ``/localstack`` must not be swept up.
+        assert redaction_mod.redact_local_paths("/localstack/data")[0] == "/localstack/data"
