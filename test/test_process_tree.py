@@ -1,10 +1,14 @@
 """Tests for process tree tracking, recursive kill, and session cleanup."""
 
+import asyncio
+import inspect
 import sys
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew.acp import runtime as rt
 from kiro_crew.acp.client import (
     AcpClient,
     _direct_children,
@@ -206,7 +210,11 @@ class TestSnapshotProcessTree:
         ):
             await client._snapshot_process_tree()
 
-        assert client._child_pids == {200: (2000, b"proc200"), 300: (3000, b"proc300"), 400: (4000, b"proc400")}
+        assert client._child_pids == {
+            200: (2000, b"proc200"),
+            300: (3000, b"proc300"),
+            400: (4000, b"proc400"),
+        }
         # Verify child:parent:start-id lines written to kiro_pids.txt
         content = (tmp_path / "kiro_pids.txt").read_text(encoding="utf-8")
         lines = {ln.strip() for ln in content.splitlines() if ln.strip()}
@@ -241,6 +249,294 @@ class TestSnapshotProcessTree:
 
         # PID 200 keeps original record, PID 300 is new
         assert client._child_pids == {200: (2000, b"node"), 300: (3000, b"proc300")}
+
+
+# ── 5b. AcpRuntime._snapshot_descendants: the runtime path tracks its tree ──
+
+
+def _snapshot_runtime(pid: int = 100) -> rt.AcpRuntime:
+    """An AcpRuntime carrying only the state _snapshot_descendants touches."""
+    r = rt.AcpRuntime.__new__(rt.AcpRuntime)
+    r._pid = pid
+    r._child_pids = {}
+    return r
+
+
+class TestRuntimeSnapshotDescendants:
+    """The runtime registers its spawn root; the tree under it must be tracked too.
+
+    On a sandboxed host the registered PID is the launcher, two forks above the
+    process holding the memory, so an untracked subtree that outlives the root is
+    reachable by no reaper — every sweep keys off the PID files.
+    """
+
+    @pytest.mark.asyncio
+    async def test_tracks_all_descendants(self, tmp_path):
+        r = _snapshot_runtime()
+
+        with (
+            patch("kiro_crew.acp.runtime._get_child_pids", return_value=[200, 300]),
+            patch("kiro_crew.platform_compat.get_process_start_id", side_effect=lambda p: p * 10),
+            patch("kiro_crew.acp.client._read_basename", side_effect=lambda p: f"proc{p}".encode()),
+            patch("kiro_crew.session_pid.config_dir", return_value=tmp_path),
+            patch("kiro_crew.session_pid._pid_start_token", side_effect=lambda p: str(p * 10)),
+        ):
+            await r._snapshot_descendants()
+
+        # The record shape session_pid verifies identity against, not a bare id.
+        assert r._child_pids == {200: (2000, b"proc200"), 300: (3000, b"proc300")}
+        lines = {
+            ln.strip()
+            for ln in (tmp_path / "kiro_pids.txt").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        }
+        assert lines == {"200:100:2000", "300:100:3000"}
+
+    @pytest.mark.asyncio
+    async def test_session_start_rescan_is_idempotent(self, tmp_path):
+        """Every session start scans again; a pid already recorded must not double."""
+        r = _snapshot_runtime()
+
+        with (
+            patch("kiro_crew.platform_compat.get_process_start_id", side_effect=lambda p: p * 10),
+            patch("kiro_crew.acp.client._read_basename", side_effect=lambda p: f"proc{p}".encode()),
+            patch("kiro_crew.session_pid.config_dir", return_value=tmp_path),
+            patch("kiro_crew.session_pid._pid_start_token", side_effect=lambda p: str(p * 10)),
+        ):
+            with patch("kiro_crew.acp.runtime._get_child_pids", return_value=[200]):
+                await r._snapshot_descendants()
+            # A second session forked another child; 200 is still there.
+            with patch("kiro_crew.acp.runtime._get_child_pids", return_value=[200, 400]):
+                await r._snapshot_descendants()
+
+        assert r._child_pids == {200: (2000, b"proc200"), 400: (4000, b"proc400")}
+        lines = [
+            ln.strip()
+            for ln in (tmp_path / "kiro_pids.txt").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        assert sorted(lines) == ["200:100:2000", "400:100:4000"]
+
+    @pytest.mark.asyncio
+    async def test_retries_once_when_the_first_scan_is_empty(self, tmp_path, monkeypatch):
+        """A scan racing a cold start sees nothing; the spawn call gets one retry."""
+        monkeypatch.setattr(rt.AcpRuntime, "_DESCENDANT_RESCAN_DELAY", 0)
+        r = _snapshot_runtime()
+        scans = [[], [200]]
+
+        with (
+            patch("kiro_crew.acp.runtime._get_child_pids", side_effect=lambda pid: scans.pop(0)),
+            patch("kiro_crew.platform_compat.get_process_start_id", side_effect=lambda p: p * 10),
+            patch("kiro_crew.acp.client._read_basename", side_effect=lambda p: f"proc{p}".encode()),
+            patch("kiro_crew.session_pid.config_dir", return_value=tmp_path),
+            patch("kiro_crew.session_pid._pid_start_token", side_effect=lambda p: str(p * 10)),
+        ):
+            await r._snapshot_descendants(retry_when_empty=True)
+
+        assert r._child_pids == {200: (2000, b"proc200")}
+        assert scans == []
+
+    @pytest.mark.asyncio
+    async def test_no_descendants_writes_nothing(self, tmp_path):
+        r = _snapshot_runtime()
+
+        with (
+            patch("kiro_crew.acp.runtime._get_child_pids", return_value=[]),
+            patch("kiro_crew.session_pid.config_dir", return_value=tmp_path),
+        ):
+            await r._snapshot_descendants()
+
+        assert r._child_pids == {}
+        assert not (tmp_path / "kiro_pids.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_scan_never_raises(self, tmp_path):
+        """Losing a snapshot must not fail the spawn or session start that called it."""
+        r = _snapshot_runtime()
+
+        with (
+            patch("kiro_crew.acp.runtime._get_child_pids", side_effect=OSError("/proc gone")),
+            patch("kiro_crew.session_pid.config_dir", return_value=tmp_path),
+        ):
+            await r._snapshot_descendants()
+
+        assert r._child_pids == {}
+
+    @pytest.mark.asyncio
+    async def test_no_pid_is_a_no_op(self):
+        r = _snapshot_runtime()
+        r._pid = None
+
+        with patch("kiro_crew.acp.runtime._get_child_pids") as scan:
+            await r._snapshot_descendants()
+
+        scan.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_scan_and_track_run_off_the_event_loop(self, tmp_path):
+        """The scan shells out on macOS and the track takes an exclusive file lock."""
+        r = _snapshot_runtime()
+        loop_thread = threading.current_thread()
+        scan_threads: list[threading.Thread] = []
+        track_threads: list[threading.Thread] = []
+
+        def _scan(pid):
+            scan_threads.append(threading.current_thread())
+            return [200]
+
+        def _track(pids, parent_pid=0):
+            track_threads.append(threading.current_thread())
+
+        with (
+            patch("kiro_crew.acp.runtime._get_child_pids", side_effect=_scan),
+            patch("kiro_crew.acp.runtime._track_child_pids", side_effect=_track),
+            patch("kiro_crew.platform_compat.get_process_start_id", side_effect=lambda p: p * 10),
+            patch("kiro_crew.acp.client._read_basename", side_effect=lambda p: f"proc{p}".encode()),
+            patch("kiro_crew.session_pid.config_dir", return_value=tmp_path),
+        ):
+            await r._snapshot_descendants()
+
+        assert scan_threads and all(t is not loop_thread for t in scan_threads)
+        assert track_threads and all(t is not loop_thread for t in track_threads)
+
+
+class TestRuntimeSnapshotDurability:
+    """What the snapshot must survive: a reused pid, a failed write, a cancel."""
+
+    @pytest.mark.asyncio
+    async def test_a_reused_pid_gets_its_identity_re_read(self, tmp_path):
+        """A recorded pid can be handed to an unrelated process.
+
+        Keeping the old start id would make the teardown sweep read the
+        replacement as recycled and skip it — the same leak by another route.
+        """
+        r = _snapshot_runtime()
+        r._child_pids = {200: ("old-start", b"node")}
+        untracked: list[dict] = []
+
+        with (
+            patch("kiro_crew.acp.runtime._get_child_pids", return_value=[200]),
+            patch("kiro_crew.acp.runtime._untrack_child_pids", side_effect=untracked.append),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value="new-start"),
+            patch("kiro_crew.acp.client._read_basename", return_value=b"stranger"),
+            patch("kiro_crew.session_pid.config_dir", return_value=tmp_path),
+            patch("kiro_crew.session_pid._pid_start_token", return_value="new-start"),
+        ):
+            await r._snapshot_descendants()
+
+        assert r._child_pids == {200: ("new-start", b"stranger")}
+        # The stale line is dropped first: _track_child_pids dedupes on the
+        # child:parent prefix, so an append alone would keep the old start id.
+        assert [sorted(d) for d in untracked] == [[200]]
+        lines = {
+            ln.strip()
+            for ln in (tmp_path / "kiro_pids.txt").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        }
+        assert lines == {"200:100:new-start"}
+
+    @pytest.mark.asyncio
+    async def test_an_escaped_pid_keeps_its_record(self, tmp_path):
+        """The walk cannot reach a child that left the group. Its record is the
+        only handle teardown has on it, so a later scan must not drop it."""
+        r = _snapshot_runtime()
+        r._child_pids = {200: ("s200", b"escaped")}
+
+        with (
+            patch("kiro_crew.acp.runtime._get_child_pids", return_value=[300]),
+            patch("kiro_crew.platform_compat.get_process_start_id", side_effect=lambda p: f"s{p}"),
+            patch("kiro_crew.acp.client._read_basename", side_effect=lambda p: f"proc{p}".encode()),
+            patch("kiro_crew.session_pid.config_dir", return_value=tmp_path),
+            patch("kiro_crew.session_pid._pid_start_token", side_effect=lambda p: f"s{p}"),
+        ):
+            await r._snapshot_descendants()
+
+        assert r._child_pids == {200: ("s200", b"escaped"), 300: ("s300", b"proc300")}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_write_publishes_nothing_and_the_next_scan_retries(self, tmp_path):
+        """The in-memory set is also the dedup filter.
+
+        Publishing before the write succeeds would put a pid past that filter
+        forever, and its entry would never be written again.
+        """
+        r = _snapshot_runtime()
+        attempts: list[int] = []
+
+        def _track(pids, parent_pid=0):
+            attempts.append(len(pids))
+            if len(attempts) == 1:
+                raise OSError("no space left on device")
+
+        with (
+            patch("kiro_crew.acp.runtime._get_child_pids", return_value=[200]),
+            patch("kiro_crew.acp.runtime._track_child_pids", side_effect=_track),
+            patch("kiro_crew.platform_compat.get_process_start_id", side_effect=lambda p: f"s{p}"),
+            patch("kiro_crew.acp.client._read_basename", side_effect=lambda p: f"proc{p}".encode()),
+            patch("kiro_crew.session_pid.config_dir", return_value=tmp_path),
+        ):
+            await r._snapshot_descendants()
+            assert r._child_pids == {}, "a pid whose write failed must stay unpublished"
+
+            await r._snapshot_descendants()
+
+        assert r._child_pids == {200: ("s200", b"proc200")}
+        assert attempts == [1, 1]
+
+    @pytest.mark.asyncio
+    async def test_a_cancellation_is_not_swallowed(self, tmp_path, monkeypatch):
+        """A cancel is not a failed scan.
+
+        It must reach the caller's cleanup guard, which owns the half-built
+        runtime or session that has to be torn down.
+        """
+        monkeypatch.setattr(rt.AcpRuntime, "_DESCENDANT_RESCAN_DELAY", 0)
+        r = _snapshot_runtime()
+
+        async def _cancel(_delay):
+            raise asyncio.CancelledError
+
+        with (
+            patch("kiro_crew.acp.runtime._get_child_pids", return_value=[]),
+            patch("kiro_crew.acp.runtime.asyncio.sleep", side_effect=_cancel),
+            patch("kiro_crew.session_pid.config_dir", return_value=tmp_path),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await r._snapshot_descendants(retry_when_empty=True)
+
+
+class TestEverySessionPathSnapshots:
+    """A fresh session and a resumed one fork the same processes.
+
+    Read off the source because driving either funnel needs a live backend: the
+    point is that neither path can lose the call or its teardown guard.
+    """
+
+    @pytest.mark.parametrize(
+        "method,session_var",
+        [("_finish_create_session", "session_id"), ("load_session", "resume_sid")],
+    )
+    def test_the_scan_runs_under_a_terminate_guard(self, method, session_var):
+        src = inspect.getsource(getattr(rt.AcpRuntime, method))
+        assert "await self._snapshot_descendants()" in src, f"{method} does not snapshot"
+        # Whitespace-normalized so an indentation change cannot pass or fail it.
+        flat = " ".join(src.split())
+        expected = (
+            "try: await self._snapshot_descendants() "
+            "except BaseException: "
+            f"await self.terminate_session({session_var}) raise"
+        )
+        guard = expected in flat
+        assert guard, f"{method} does not terminate its session when the scan is cancelled"
+
+    def test_spawn_snapshots_inside_its_cleanup_guard(self):
+        """A cancelled scan after `_initialized` would leave an unowned process."""
+        src = inspect.getsource(rt.AcpRuntime._spawn_admitted)
+        after = " ".join(src[src.index("await self._snapshot_descendants(") :].split())
+        assert after.startswith(
+            "await self._snapshot_descendants(retry_when_empty=True) except BaseException:"
+        ), "the spawn snapshot sits outside the cleanup guard"
+        assert "await self.kill(" in after, "the guard does not tear the runtime down"
 
 
 # ── 6. Session cleanup on cancellation ──

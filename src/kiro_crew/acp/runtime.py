@@ -43,9 +43,12 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp._frame_record import record_frame
 from kiro_crew.acp.client import (
+    ChildRecord,
     OversizeLineUnrecoverable,
     _apply_pod_home_remap,
+    _capture_child_records,
     _drain_oversize_line,
+    _get_child_pids,
     _KiroExecutableTrustError,
     apply_pod_bundle_spawn,
     finish_suspended_spawn,
@@ -133,8 +136,11 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_pid import (
+    _pid_gone_or_unmanaged,
+    _track_child_pids,
     _track_pid,
     _track_session_pid,
+    _untrack_child_pids,
     _untrack_pid,
     _untrack_session_pid,
     register_protected_pid,
@@ -143,6 +149,31 @@ from kiro_crew.session_pid import (
 from kiro_crew.validation import MODEL_ID_RE
 
 logger = logging.getLogger(__name__)
+
+
+def _prune_dead_descendants(saved: dict[int, ChildRecord]) -> list[int]:
+    """Untrack the descendants that are gone; return the ones still alive.
+
+    A descendant's entry is pruned by ITS OWN liveness, never by the root's
+    fate. One that escaped the group kill (it called setsid, so killpg never
+    reached it) must keep its entry: that entry is the only handle the periodic
+    sweep and the next startup cleanup have on it, and dropping it is precisely
+    the leak this tracking exists to close.
+
+    A synchronous unit so the caller can hand the whole thing to a worker
+    thread: the liveness probes read ``/proc`` and the untrack takes the PID
+    file's exclusive lock, neither of which may run on the event loop.
+    """
+    dead = {pid: rec for pid, rec in saved.items() if _pid_gone_or_unmanaged(pid)}
+    if dead:
+        try:
+            _untrack_child_pids(dead)
+        except Exception:
+            logger.debug(
+                "AcpRuntime: untracking descendant PIDs %s failed", list(dead), exc_info=True
+            )
+    return [pid for pid in saved if pid not in dead]
+
 
 __all__ = [
     "AcpRuntime",
@@ -1317,7 +1348,13 @@ class AcpRuntime:
         self._pid: int | None = None
         self._start_time: str | None = None
         self._spawn_monotonic: float | None = None
-        self._child_pids: dict[int, int | None] = {}
+        # pid -> (start_id, basename): the record shape session_pid verifies a
+        # descendant's identity against before it signals one, so a recycled pid
+        # is skipped. Written by _snapshot_descendants at spawn and on every
+        # session start -- nothing populated it before, which left
+        # _provider_descendant_records with only its live walk, and a walk can
+        # run only while the root is alive.
+        self._child_pids: dict[int, ChildRecord] = {}
         # Names THIS spawn of the shared child process (fresh per spawn, cleared
         # with the process) — the identity a resource minted by the child is
         # compared against later. See AcpClient.process_instance for why the
@@ -2300,6 +2337,15 @@ class AcpRuntime:
             await asyncio.to_thread(require_unchanged_derived_spec, self._derived_spec_snapshot)
             self._initialized = True
             logger.info("AcpRuntime initialized (PID %d)", self._pid)
+            # INSIDE the guard, which is what makes a cancelled scan safe. The
+            # runtime is already `_initialized` here and the caller does not hold
+            # it yet, so a CancelledError raised inside the scan -- an ordinary
+            # shutdown or a spawn-budget timeout during a /proc walk -- would
+            # otherwise leave a live process nobody owns. The guard's kill is the
+            # right answer to that, and it cannot fire for a merely FAILED scan:
+            # _snapshot_descendants swallows every Exception itself, so only a
+            # cancellation reaches this arm.
+            await self._snapshot_descendants(retry_when_empty=True)
         except BaseException:
             try:
                 # This death IS abnormal (failed spawn/handshake): kill()'s
@@ -2310,6 +2356,109 @@ class AcpRuntime:
                     "AcpRuntime: cleanup kill after failed spawn/handshake failed", exc_info=True
                 )
             raise
+
+    #: One retry for a descendant scan that came back empty. The spawned root
+    #: is a launcher that forks the agent, which forks again, so a scan racing a
+    #: cold start can legitimately see nothing. A single retry is enough because
+    #: every later session start scans again. Class attribute so tests can zero
+    #: it rather than pay it.
+    _DESCENDANT_RESCAN_DELAY = 0.5
+
+    async def _snapshot_descendants(self, *, retry_when_empty: bool = False) -> None:
+        """Record this runtime's descendant PIDs in the tracking file.
+
+        The PID this runtime registers is the sandbox launcher, not the agent:
+        the tree is ``launcher -> agent -> agent chat process -> MCP servers``,
+        and every one of those below the root held no entry in either PID file.
+        A root that died before its subtree -- a teardown race, a crash mid-init
+        -- therefore left a multi-hundred-MB subtree reparented to init that no
+        reaper could act on, because every sweep keys off those files.
+
+        Safe to call on every session start, and it re-reads the identity of a
+        pid it already holds rather than trusting the one it recorded. A
+        descendant can exit and its number be handed to an unrelated process
+        under a long-lived runtime; keeping the old start id there would make the
+        teardown sweep read the replacement as recycled and skip it, which is the
+        same leak by another route. A pid the walk cannot reach keeps its
+        record: that is the child that left the process group, and its record is
+        the only handle the teardown has on it.
+
+        The tracking file is written BEFORE the in-memory set is updated. Those
+        two must not be reordered: the set is also the dedup filter, so
+        publishing first and failing the write would put a pid past the filter
+        forever and its entry would never be written again. Failing this way
+        costs one scan, not the entry -- the next session start sees the same
+        pids as unrecorded and retries.
+
+        Never raises on failure. A failed scan must not fail the spawn or the
+        session start that called it -- the cost is a leak the sweep still
+        reports, not a broken session -- but it logs at WARNING, because that
+        report is then the only signal left. A CANCELLATION is not a failure and
+        is deliberately NOT swallowed: it reaches the caller's cleanup guard,
+        which owns the half-built runtime or session it must tear down.
+
+        POSIX-shaped: ``_get_child_pids`` short-circuits on Windows, where the
+        tree kill walks descendants itself through ``taskkill /T``.
+        """
+        pid = self._pid
+        if pid is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            # /proc reads on Linux, `pgrep`/`ps` subprocesses on macOS: blocking
+            # either way, so they ride the same dedicated executor the client
+            # path and the teardown sweep use instead of the event loop.
+            descendants = await loop.run_in_executor(subprocess_executor(), _get_child_pids, pid)
+            if not descendants and retry_when_empty:
+                await asyncio.sleep(self._DESCENDANT_RESCAN_DELAY)
+                descendants = await loop.run_in_executor(
+                    subprocess_executor(), _get_child_pids, pid
+                )
+            if not descendants:
+                return
+            # Every descendant the walk reached, not only the unrecorded ones:
+            # that is what answers a reused pid (see the docstring).
+            fresh: dict[int, ChildRecord] = await loop.run_in_executor(
+                subprocess_executor(), _capture_child_records, descendants
+            )
+            recycled = {
+                p: rec
+                for p, rec in fresh.items()
+                if p in self._child_pids and self._child_pids[p] != rec
+            }
+            if not recycled and all(p in self._child_pids for p in fresh):
+                return
+            merged = dict(self._child_pids)
+            merged.update(fresh)
+            # A recycled pid already has a line under the same `child:parent`
+            # key, and _track_child_pids dedupes on that prefix, so the stale
+            # start id would survive an append. Drop those lines first.
+            if recycled:
+                await loop.run_in_executor(
+                    subprocess_executor(),
+                    functools.partial(_untrack_child_pids, recycled),
+                )
+            # An exclusive file lock plus a read-modify-append per entry, off the
+            # loop for the same reason as the scan above.
+            await loop.run_in_executor(
+                subprocess_executor(),
+                functools.partial(_track_child_pids, merged, parent_pid=pid),
+            )
+            self._child_pids = merged
+            logger.info(
+                "AcpRuntime: tracked %d descendant PID(s) of root %d (%d re-read after "
+                "a pid was reused)",
+                len(merged),
+                pid,
+                len(recycled),
+            )
+        except Exception:
+            logger.warning(
+                "AcpRuntime: descendant PID snapshot failed for root %s -- a tree "
+                "that outlives this runtime would be invisible to every reaper",
+                pid,
+                exc_info=True,
+            )
 
     # Grace window for SIGTERM before escalating, and the post-SIGKILL reap
     # window. Class attributes so tests can shrink them.
@@ -2427,6 +2576,21 @@ class AcpRuntime:
                     unregister_protected_pid(pid)
                 except Exception:
                     logger.debug("AcpRuntime: PID untracking failed for %s", pid, exc_info=True)
+
+            # Runs on BOTH branches above: whether the root died or survived says
+            # nothing about a descendant that left the process group, and the
+            # entry of one still running is what the sweep needs to reap it.
+            saved_children = dict(self._child_pids)
+            self._child_pids = {}
+            if saved_children:
+                survivors = await asyncio.to_thread(_prune_dead_descendants, saved_children)
+                if survivors:
+                    logger.warning(
+                        "AcpRuntime: retained tracking for %d descendant PID(s) that "
+                        "survived teardown; the orphan sweep will reap them: %s",
+                        len(survivors),
+                        survivors,
+                    )
 
     # ── Reader Task (single owner of stdout) ──
 
@@ -4898,6 +5062,21 @@ class AcpRuntime:
                     "prompt"
                 ]
 
+        # Each session start forks another agent process under the root, and
+        # its MCP servers have just reported, so scan again: the spawn snapshot
+        # predates all of them. Safe to repeat -- see _snapshot_descendants.
+        #
+        # Guarded like every other post-session/new step here: session/new has
+        # already succeeded, so a cancellation inside the scan would leave the
+        # session live in the shared process with no handle returned to anyone.
+        # Only a cancellation can reach this arm; the scan swallows its own
+        # failures.
+        try:
+            await self._snapshot_descendants()
+        except BaseException:
+            await self.terminate_session(session_id)
+            raise
+
         logger.info("Created session %s on runtime PID %d", session_id, self._pid or 0)
         return handle
 
@@ -5277,6 +5456,16 @@ class AcpRuntime:
             )
         else:
             await handle.drain_init(no_report_ceiling=0.0)
+
+        # A resume re-initializes the MCP servers and forks the same agent
+        # processes a fresh session does, so it needs the same scan; without it
+        # every descendant a resumed session created stays unrecorded. Guarded
+        # for the same reason as create_session: session/load already succeeded.
+        try:
+            await self._snapshot_descendants()
+        except BaseException:
+            await self.terminate_session(resume_sid)
+            raise
 
         logger.info("Resumed session %s on runtime PID %d", resume_sid, self._pid or 0)
         return handle

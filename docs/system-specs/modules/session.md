@@ -1847,15 +1847,48 @@ the internal MCP server, slack-mcp) in separate process groups.  When a
 session dies, `killpg` only reaches the kiro-cli process group — MCP servers
 in other groups get reparented to init and leak memory.
 
-**Tracking**: at session init, `AcpClient.ensure_ready()` snapshots all
-descendant PIDs and persists them to `kiro_pids.txt` as
-`child_pid:parent_pid[:start-id]` entries via
-`_track_child_pids(pids, parent_pid=self._pid)`; the third field is the
+**Tracking**: both transports snapshot their descendant PIDs and persist
+them to `kiro_pids.txt` as `child_pid:parent_pid[:start-id]` entries via
+`_track_child_pids(pids, parent_pid=<root pid>)`; the third field is the
 child's process-start identity (`_pid_start_token`, colon-free, in-process
 and non-blocking on every platform), omitted only when unreadable at track
-time.  On clean shutdown,
-`_reset_state()` removes them via `_untrack_child_pids()`.  If the gateway
-crashes, the entries remain in the file for the next startup.
+time.  `AcpClient` snapshots in `ensure_ready()`.  `AcpRuntime` snapshots in
+`_snapshot_descendants()`, called repeatedly for a reason the one-shot client
+scan does not face: the runtime's registered PID is the sandbox launcher, and
+the tree under it is `launcher -> agent -> agent chat process -> MCP servers`,
+so the scan runs when the initialize handshake proves the agent came up and
+then at the end of every `_finish_create_session()` and `load_session()`,
+because each session start — fresh or resumed — forks another agent process
+and re-initializes MCP servers the earlier scan could not have seen.
+
+Three properties make repeating it safe and make its record trustworthy:
+
+- **Identity is re-read, not remembered.** Every scan captures a record for
+  every descendant the walk reaches, not only the unrecorded ones.  A pid can
+  be released and handed to an unrelated process under a long-lived runtime;
+  keeping the recorded start id would make the teardown sweep read the
+  replacement as recycled and skip it.  A pid whose identity changed has its
+  line dropped through `_untrack_child_pids` before the re-track, because
+  `_track_child_pids` dedupes on the `child:parent` prefix and an append alone
+  would leave the stale id in the file.  A pid the walk cannot reach keeps
+  its record: that is the child that left the process group.
+- **The file is written before the in-memory set.** That set is also the dedup
+  filter, so publishing first and failing the write would put a pid past the
+  filter permanently and its entry would never be written again.  A failed
+  write costs one scan; the next session start retries it.
+- **A failure never raises, a cancellation always does.**  Losing a snapshot
+  must not fail a live session, so every `Exception` is logged at WARNING and
+  swallowed.  A `CancelledError` is not a failure and reaches the caller's
+  cleanup guard, which kills the half-built runtime or terminates the session
+  it owns.
+
+On clean shutdown each transport prunes entries by the DESCENDANT's own
+liveness, never by the root's fate: `AcpClient._reset_state()` and
+`AcpRuntime._kill_inner()` (through `_prune_dead_descendants`) untrack only the
+children confirmed gone and log the survivors at WARNING.  A child that
+escaped the group kill by calling `setsid` keeps its entry, because that entry
+is the only handle the periodic sweep and the next startup cleanup have on it.
+If the gateway crashes, the entries remain in the file for the next startup.
 
 **Detection**: reads `kiro_pids.txt`, processes only `child:parent` lines
 (bare PID lines are kiro-cli parents handled by `cleanup_orphaned_sessions()`).
