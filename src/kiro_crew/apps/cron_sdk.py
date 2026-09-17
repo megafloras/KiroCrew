@@ -437,6 +437,52 @@ class CronSDK:
         )
         logger.info("App %s removed cron job: %s", self._app_name, job_id)
 
+    # ── Enable / disable ──
+
+    def set_enabled(self, job_id: str, enabled: bool) -> bool:
+        """Pause/resume an owned job without replacing its ID or history.
+
+        Synchronous, off-loop only. Ownership is rechecked inside the service's
+        lock against the freshly loaded store, not an SDK cache snapshot.
+        """
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        try:
+            result = _run_sync_mutator(
+                self._cron.enable_job,
+                job_id,
+                enabled,
+                expected_owner=self._owner_prefix,
+                _api="set_enabled",
+            )
+        except PermissionError:
+            self._audit_enabled(job_id, "denied")
+            raise
+        self._audit_enabled(job_id, "ok")
+        return result
+
+    async def set_enabled_async(self, job_id: str, enabled: bool) -> bool:
+        """Event-loop-native :meth:`set_enabled`; same ownership and audit rules."""
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        try:
+            result = await self._cron.enable_job_async(
+                job_id, enabled, expected_owner=self._owner_prefix
+            )
+        except PermissionError:
+            self._audit_enabled(job_id, "denied")
+            raise
+        self._audit_enabled(job_id, "ok")
+        return result
+
+    def _audit_enabled(self, job_id: str, outcome: str) -> None:
+        sel().log_api_access(
+            caller=f"app:{self._app_name}",
+            operation="cron_set_enabled",
+            outcome=outcome,
+            resources=job_id,
+        )
+
     # ── Update ──
 
     def update_job(self, job_id: str, **kwargs: Any) -> Any:
@@ -447,6 +493,8 @@ class CronSDK:
         Returns the updated CronJob or None.
         """
         self._assert_owned(job_id, "cron_update_job")
+        if "enabled" in kwargs or "user_paused" in kwargs:
+            raise ValueError("Use set_enabled or set_enabled_async to pause/resume a job")
         result = _run_sync_mutator(
             self._cron.update_job, job_id, _api="update_job", **kwargs
         )
@@ -457,6 +505,8 @@ class CronSDK:
         """Event-loop-native :meth:`update_job` (routes through
         ``CronService.update_job_async``)."""
         self._assert_owned(job_id, "cron_update_job")
+        if "enabled" in kwargs or "user_paused" in kwargs:
+            raise ValueError("Use set_enabled or set_enabled_async to pause/resume a job")
         result = await self._cron.update_job_async(job_id, **kwargs)
         self._audit_update(job_id)
         return result

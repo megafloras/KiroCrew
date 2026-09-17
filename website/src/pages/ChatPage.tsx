@@ -1016,7 +1016,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // ErrorNotice; the newest failure wins, the same shape as `refusedPress`.
   // `title` is optional because several sites already own a whole-sentence
   // message ("Fork failed: …") that must stay intact for the error-journal match.
-  const [actionError, setActionError] = useState<{ title?: string; message: string } | null>(null)
+  const [actionError, setActionError] = useState<{ title?: string; message: string; preserveOnSwitch?: boolean } | null>(null)
   const showActionError = useCallback((message: string, title?: string) => {
     // Same failure re-reported (an effect re-run, a retry that fails the same
     // way) keeps the stored object, so React bails out instead of re-rendering.
@@ -1256,6 +1256,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const [prefillEdited, setPrefillEdited] = useState(false)
   const raisePrefillHint = useCallback(() => { setPrefillHint(true); setPrefillEdited(false) }, [])
   const autoSendRef = useRef<string | null>(null)
+  const appLaunchSendRef = useRef<{ slotKey?: string } | null>(null)
   const [autoSendTick, setAutoSendTick] = useState(0)
   const newSessionRef = useRef(false)
   // True while the challenge-redirect token effect is creating/linking its
@@ -1547,20 +1548,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
   }, [pendingInput, activeSlot, dispatch, searchParams, setSearchParams, saveDraftsDebounced, embedded, raisePrefillHint])
 
-  // Consume chat launch intent from app-sdk (useChatLauncher writes to window.__mc_chat_launch)
-  useEffect(() => {
-    const launchWindow = window as Window & {
-      __mc_chat_launch?: { ts?: number; agent?: string; message?: string }
-    }
-    const intent = launchWindow.__mc_chat_launch
-    if (!intent || Date.now() - (intent.ts ?? 0) > 10_000) return
-    delete launchWindow.__mc_chat_launch
-    if (intent.agent) setPendingAgent(intent.agent)
-    if (intent.message) { autoSendRef.current = intent.message; newSessionRef.current = true }
-    // setPendingAgent is a stable useState setter, so including it keeps this a
-    // mount-only "consume the one-shot window global" effect.
-  }, [setPendingAgent])
-
   // Consume ?prefill= — the no-main-window fallback path for navigation
   // intents forwarded from a popout (see utils/popoutController.ts). The
   // fallback opens `/chat?sid=<slot>&prefill=<prompt>` in a fresh tab, which
@@ -1756,7 +1743,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     setUploadHint('')
     // A pane-level action failure ("Fork failed", "Could not read …") belongs to
     // the slot it happened in; carried over, it reads as the new slot's.
-    setActionError(null)
+    setActionError(prev => prev?.preserveOnSwitch ? prev : null)
     flushDrafts()
   }, [activeSlot, flushDrafts, raisePrefillHint])
   // Persist drafts on unmount (navigating away from chat page)
@@ -2162,6 +2149,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     tokenConsumingRef,
   })
   const {
+    appSlotLaunch,
+    setAppSlotLaunch,
     closeSessionTab,
     drawerPopRef,
     handleResumeSession,
@@ -2180,6 +2169,52 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     setSidError,
     sidError,
   } = session
+
+  // Only the routed chat consumes app launch intents. Existing-slot messages
+  // arrive here only after the session controller has fulfilled activation.
+  useEffect(() => {
+    if (embedded || !connected) return
+    const launchWindow = window as Window & {
+      __mc_chat_launch?: { ts?: number; agent?: string; message?: string; slotKey?: string; autoSend?: boolean }
+    }
+    const intent = appSlotLaunch ?? launchWindow.__mc_chat_launch
+    if (!intent) return
+    if (!appSlotLaunch) {
+      if (Date.now() - (launchWindow.__mc_chat_launch?.ts ?? 0) > 10_000) {
+        delete launchWindow.__mc_chat_launch
+        return
+      }
+      // The controller owns existing-slot activation and fresh-draft creation.
+      if (intent.slotKey || intent.autoSend === false) return
+      delete launchWindow.__mc_chat_launch
+    } else {
+      if (slotLoading) return
+      setAppSlotLaunch(null)
+      // A user switch while activation was pending cancels this launch rather
+      // than sending into whichever conversation they chose instead.
+      if (activeSlot !== intent.slotKey) {
+        if (intent.message) setActionError({ message: `${i18nT('pages.chatPage.send_failed')}\n\n${intent.message}`, preserveOnSwitch: true })
+        return
+      }
+    }
+    // An existing slot keeps its own agent. Agent selection applies only to a
+    // new session, never as an implicit switch of an existing private binding.
+    if (intent.agent && !intent.slotKey) setPendingAgent(intent.agent)
+    if (!intent.message) return
+    if (intent.autoSend === false && activeSlot) {
+      newSessionRef.current = false
+      const merged = mergeIntoDraft(drafts.current[activeSlot], intent.message)
+      setDraft(drafts.current, activeSlot, merged)
+      saveDraftsDebounced()
+      setInput(merged)
+      raisePrefillHint()
+    } else {
+      autoSendRef.current = intent.message
+      appLaunchSendRef.current = { slotKey: intent.slotKey }
+      newSessionRef.current = !intent.slotKey
+      setAutoSendTick(t => t + 1)
+    }
+  }, [embedded, connected, activeSlot, slotLoading, location.key, appSlotLaunch, setAppSlotLaunch, saveDraftsDebounced, raisePrefillHint, setPendingAgent])
 
   // Auto-scroll during streaming — only when pinned to bottom
   const lastMsg = messages[messages.length - 1]
@@ -2266,7 +2301,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // intercepted locally, transport error, refused). UI reactions all stay
   // inside send(); the verdict exists for callers that persist state only on
   // delivery (ArtifactPanel's submit-to-chat batch marks comments sent on it).
-  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean): Promise<boolean> => {
+  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean, isolated = false): Promise<boolean> => {
     // Defense-in-depth: ChatInput already gates Send/Optimize buttons and
     // the keyboard Enter shortcut on `connected`, but a future caller (a
     // programmatic dispatch from a hotkey, a follow-up option click, an
@@ -2275,18 +2310,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // message with no recovery path is the offline-UX regression we're
     // guarding against. Cheap belt-and-braces.
     if (!connected) return false
-    const raw = (optionText || inputRef.current).trim()
- // Capture + clear the widget-origin tag: attribute this
-    // turn to a widget only if the composer still carries the exact text a
-    // widget action pre-filled. Cleared on every send so it can't go stale.
-    const widgetOrigin = !!widgetPrefillRef.current && raw.includes(widgetPrefillRef.current)
-    widgetPrefillRef.current = null
-    if (!raw && !pendingFilesRef.current.length && !pendingSessionsRef.current.length) return false
+    const raw = (isolated ? optionText ?? '' : optionText || inputRef.current).trim()
+    // App launches own only their explicit text, not the composer's staged data.
+    const widgetOrigin = !isolated && !!widgetPrefillRef.current && raw.includes(widgetPrefillRef.current)
+    if (!isolated) widgetPrefillRef.current = null
+    if (!raw && (isolated || (!pendingFilesRef.current.length && !pendingSessionsRef.current.length))) return false
 
     // Sending while STREAMING dictation is live ends the dictation (see
     // `useComposerVoice.disarmForSend` for the full rationale — streaming only,
     // batch keeps capturing and lands its transcript when the user stops).
-    composerRef.current?.voice()?.disarmForSend()
+    if (!isolated) composerRef.current?.voice()?.disarmForSend()
 
     // The session actually on screen at send time. Read from the ref (fresh
     // every render), not the closure `activeSlot` (stale until send() is
@@ -2359,25 +2392,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // Snapshot the staged attachments BEFORE the composer is cleared below, so a
     // failed send can put them back (prepareSendPayload's `filePaths` drops
     // images, which would silently lose them on restore).
-    const sentFiles = pendingFilesRef.current.slice()
-    // Staged refs belong to the COMPOSER, so only a send that consumes the
-    // composer may carry them. An `optionText` send (a follow-up option click)
-    // supplies its own text and deliberately leaves the composer untouched —
-    // the clear below is skipped for exactly that reason. Consuming refs there
-    // anyway would attach them to an unrelated message AND leave them staged, so
-    // the same links would go out again on the user's next real send.
-    //
-    // Gated on the same condition as the clear, so the two can never disagree in
-    // either direction: no send-without-clear (duplicate) and no clear-without-
-    // send (silent loss). Scoped to refs on purpose — `pendingFiles` has carried
-    // this shape since long before this feature, and changing it here would widen
-    // the PR into pre-existing attachment behaviour.
-    const sentSessionRefs = optionText ? [] : pendingSessionsRef.current.slice()
-    // Snapshot the staged files BEFORE the optimistic clear below: if the
-    // server answers `queued`, this send's pre-serialization composer state
-    // is stashed so a cancel can restore it losslessly (see queuedSendStash).
-    const stagedFilesAtSend = [...new Set(pendingFilesRef.current)]
-    const { txt: typedTxt, displayTxt: typedDisplayTxt, filePaths } = prepareSendPayload(raw, pendingFilesRef.current)
+    const sentFiles = isolated ? [] : pendingFilesRef.current.slice()
+    // Explicit text already excludes staged session refs. App launches also
+    // exclude files, paste expansion and knowledge, without changing legacy
+    // option-click or composer-send behavior.
+    const sentSessionRefs = isolated || optionText ? [] : pendingSessionsRef.current.slice()
+    const stagedFilesAtSend = [...new Set(sentFiles)]
+    const { txt: typedTxt, displayTxt: typedDisplayTxt, filePaths } = isolated
+      ? { txt: raw, displayTxt: raw, filePaths: [] }
+      : prepareSendPayload(raw, sentFiles)
     // Folder references serialize like files but from the text alone: each
     // `@rel/` token becomes `[attached_dir N] /abs/path` in the LLM-facing
     // text (absolute, so the reference survives a cwd/project mismatch and
@@ -2386,7 +2409,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // file pass: file tokens never end in `/`, so the two rewrites are
     // disjoint. `dirPaths` rides `meta.dirs`, ordered so marker N indexes
     // dirPaths[N-1] losslessly.
-    const { llm: typedTxtDirs, dirPaths } = serializeDirTokens(typedTxt, currentProjectRef.current || '')
+    const { llm: typedTxtDirs, dirPaths } = isolated
+      ? { llm: typedTxt, dirPaths: [] }
+      : serializeDirTokens(typedTxt, currentProjectRef.current || '')
     // Staged session references become plain markdown links appended to the
     // message — deliberately a POINTER, not the referenced transcript. Inlining
     // another session's content would spend a large share of THIS session's
@@ -2406,20 +2431,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const displayTxt = appendSessionRefLinks(typedDisplayTxt, sentSessionRefs)
     // Expand paste tokens for the LLM; UI-facing displayTxt keeps the tokens
     // intact so the user bubble can render them as clickable chips.
-    const activePastes = pasteBlocksRef.current
+    const activePastes = isolated ? [] : pasteBlocksRef.current
     let llmTxt = activePastes.length ? expandPasteTokens(txt, activePastes) : txt
     // Prepend knowledge context if pending
     let knowledgeBlock: import('./chat/useKnowledgeFetch').KnowledgeBlock | null = null
-    if (knowledgeFetchRef.current.pendingKnowledge) {
+    if (!isolated && knowledgeFetchRef.current.pendingKnowledge) {
       knowledgeBlock = knowledgeFetchRef.current.pendingKnowledge
       llmTxt = expandKnowledgeBlock(knowledgeBlock) + '\n' + llmTxt
     }
-    knowledgeFetchRef.current.clearPending()
+    if (!isolated) knowledgeFetchRef.current.clearPending()
     const bubblePastes = pruneBlocksUtil(displayTxt, activePastes)
     if (bubblePastes.length) saveStoredPaste(llmTxt, displayTxt, bubblePastes, filePaths)
 
-    setPrefillHint(false)
-    if (!optionText) {
+    if (!isolated) setPrefillHint(false)
+    if (!isolated && !optionText) {
       setInput(''); setPendingFiles([]); pickedFileTokens.current = {}; setPasteBlocks([]); setPendingSessions([]); if (uiSlot) { delete drafts.current[uiSlot]; delete fileDrafts.current[uiSlot]; delete pasteDrafts.current[uiSlot]; delete sessionRefDrafts.current[uiSlot]; saveDrafts() }
       // The challenge-handoff prompt is seeded into PREFILL_STORAGE_KEY and the
       // slot-restore effect re-applies it on slot changes. Once that prompt is
@@ -2450,6 +2475,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         created = await dispatch(createSlot({ agent: pendingAgentRef.current || defaultAgent || undefined, model: pendingModelRef.current || undefined, mode: modeRef.current })).unwrap()
       } catch (e: unknown) {
         sendingRef.current = false
+        if (isolated) {
+          // The app never consumed the composer. Keep its payload in the
+          // page-level copyable notice, which survives slot switches, instead
+          // of a draft or a user row that would age pending approvals.
+          const failure = i18nT('pages.chatPage.send_failed_with_error', { error: createFailReason(e) })
+          setActionError({ message: `${failure}\n\n${raw}`, title: i18nT('pages.chatPage.could_not_start_a_new_session'), preserveOnSwitch: true })
+          return false
+        }
         // Recover the payload WITHOUT clobbering anything newer. Two traps make a
         // plain assignment lossy here:
         //  - The composer is only cleared above when `!optionText`, and the
@@ -2629,7 +2662,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (!_busy || forceNew) {
       dispatch(appendMessage({ role: 'user', content: displayTxt, cls: '', ts: new Date().toISOString(), meta: metaPayload }))
     }
-    window.dispatchEvent(new Event('voice-stop'))
+    if (!isolated) window.dispatchEvent(new Event('voice-stop'))
     sendingRef.current = false
     setTimeout(() => scrollBottom(), SCROLL_AFTER_RENDER_MS)
     if (slot) dispatch(startLocalTurn(slot))
@@ -2662,7 +2695,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
      * rule so a reference staged while the send was in flight is not clobbered.
      */
     const restoreComposerAfterFailedSend = () => {
-      if (!slot) return
+      // App payloads remain in the page-level error notice for copying; the
+      // composer was never consumed and must not gain the app's text or chips.
+      if (!slot || isolated) return
       // Ownership of the live composer state, not the active tab: see the
       // steer receipt's `onScreenNow` for the mid-switch window this closes.
       const onScreenNow = composerSlotRef.current === slot
@@ -2726,6 +2761,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // slot-keyed inverse of the `startLocalTurn` above; `appendSlotMessage`
     // routes to the slot's own list, the active one included).
     const failLocalTurn = (message: ChatMessage) => {
+      if (isolated) {
+        if (slot) dispatch(endLocalTurn(slot))
+        setActionError({ message: `${message.content}\n\n${raw}`, preserveOnSwitch: true })
+        return
+      }
       if (slot) {
         dispatch(endLocalTurn(slot))
         dispatch(appendSlotMessage({ slot, message }))
@@ -2875,7 +2915,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [connected, tabsCtl.activeTab, activeSlot, dispatch, send])
 
   // Auto-send when navigated with ?autoSend=1 or ?token= with prompt
-  useEffect(() => { if (connected && autoSendRef.current) { const txt = autoSendRef.current; autoSendRef.current = null; send(txt) } }, [send, connected, autoSendTick])
+  useEffect(() => {
+    if (!connected || !autoSendRef.current) return
+    const txt = autoSendRef.current
+    const appLaunch = appLaunchSendRef.current
+    autoSendRef.current = null
+    appLaunchSendRef.current = null
+    send(txt, appLaunch?.slotKey, undefined, !!appLaunch)
+  }, [send, connected, autoSendTick])
 
   // Widget interactivity: when a mcwidget iframe fires an action, PRE-FILL the
  // composer instead of auto-submitting. Auto-submitting would be a

@@ -1,3 +1,4 @@
+import { installSessionExpiryHandler } from './sessionExpirySignal'
 import { resizeImageForModel, type ResizeInfo } from '../utils/resizeImage'
 import type {
   AppContributor,
@@ -1525,6 +1526,7 @@ function handleStaleOwnerSession(): void {
 // it supplies the prompt those detections raise. Re-exported so consumers of
 // the blessed transport can reference the wire contract from one place.
 installStaleOwnerHandler(handleStaleOwnerSession)
+installSessionExpiryHandler(checkSessionExpired)
 export { STALE_OWNER_SESSION_CODE }
 
 /**

@@ -118,6 +118,14 @@ The downstream `_is_restricted_session` check can still reject the call with HTT
 
 ## Cron Service (`cron.py`)
 
+App-owned pause/resume uses `CronSDK.set_enabled` or its async sibling. The
+existing service transition checks `expected_owner` after reloading the store
+inside the mutation lock, so a stale SDK snapshot cannot authorize a foreign job.
+A missing or foreign target raises and the SDK records an ownership denial.
+The transition preserves ID/history and the existing user/auto-pause semantics;
+a synchronous SDK call on the event loop refuses. App update methods reject
+`enabled` and direct callers to the toggle API. No new cron grant is introduced.
+
 Agent jobs optionally carry `member_id`, a Crew Member alias distinct from the
 provider template `agent_id`. Creation pins the member's private `memory_store`
 in the same atomic schedule write. Jobs created from a member conversation
