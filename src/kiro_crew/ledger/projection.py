@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
@@ -76,8 +76,51 @@ TIMELINE_LIMIT: Final[int] = 200
 #: exact and ``names_omitted`` counts the names left out.
 TOOL_NAME_LIMIT: Final[int] = 100
 
+#: Distinct models a ``usage`` projection details per model. Past it the whole-
+#: session totals stay exact and ``models_omitted`` counts the models left out,
+#: the same posture as ``TOOL_NAME_LIMIT``. A turn carries a model string, so an
+#: unbounded ``by_model`` would grow the checkpoint over a long session.
+MODEL_LIMIT: Final[int] = 100
+
 #: Open tool calls and pending approvals listed individually.
 OPEN_LIST_LIMIT: Final[int] = 50
+
+#: Open tool calls and pending approvals RETAINED in the fold state. The render
+#: lists ``OPEN_LIST_LIMIT`` of them, but the state kept every id it had not yet
+#: matched, so a session that leaked unmatched calls or approvals grew the
+#: checkpoint without bound -- the one thing this module says it never does. Past
+#: this cap a further distinct id is COUNTED as omitted and not retained, so the
+#: state stays bounded and a later completion for a dropped id reads as unmatched
+#: rather than reopening unbounded growth. Set above the render cap so the listed
+#: window is always drawn from retained entries.
+OPEN_RETAIN_LIMIT: Final[int] = 512
+
+#: Distinct MCP servers a single tool row records. A tool called through many
+#: servers would otherwise append every distinct name to its row without bound.
+SERVERS_PER_TOOL_LIMIT: Final[int] = 32
+
+#: Characters of any retained LABEL -- a tool or model name, a server, an
+#: approval's tool or reason, a decision. Capping the COUNT of retained values
+#: bounds nothing on its own: every one of these strings comes off the wire, and
+#: a handful of near-64-KiB ones dwarf the budget they are counted against. A
+#: label is a display value, so the honest bound is to keep its head and let the
+#: tail go.
+TEXT_LIMIT: Final[int] = 200
+
+#: Characters of a retained IDENTITY -- a tool ``call_id``, an ``approval_id``.
+#: These are NOT truncated like a label: two distinct ids sharing a 200-character
+#: head would become one identity, and one completion would then close a
+#: different call's frame. Past this length an id identifies NOTHING, exactly like
+#: an absent one, and is counted and left unpaired.
+ID_LIMIT: Final[int] = 200
+
+#: Entries folded per pass over a log. Five folds consume the same entries, so a
+#: single generator would be exhausted by the first one and the span has to be
+#: materialized -- but materializing the WHOLE span puts an entire cold-folded
+#: log in memory at once, and a cold fold is the ordinary first read for any
+#: session. Folding in chunks keeps one pass over the file while bounding what is
+#: held to this many entries.
+FOLD_CHUNK_ENTRIES: Final[int] = 1024
 
 #: The token dimensions ``turn/completed`` bills, in the order it declares them.
 TOKEN_DIMENSIONS: Final[tuple[str, ...]] = ("input", "output", "cache_read", "cache_write")
@@ -291,6 +334,13 @@ class SessionProjections:
     session_id: str
     last_seq: int
     checkpoints: Mapping[str, Checkpoint] = field(default_factory=dict)
+    #: The crew log file's creation identity when these checkpoints were folded,
+    #: so a reuse (:func:`fold_session` ``since=``) can tell that the log it folds
+    #: now is the SAME file. A log removed and recreated restarts its seqs, and if
+    #: it grows past the cached seq before the next fold the seq guard alone
+    #: passes -- stale state would then apply to a different file's bytes. ``None``
+    #: when no log existed (the empty bundle) and never matches a real file.
+    origin: str | None = None
 
     def projection(self, name: str) -> Projection:
         """One rendered projection, or raise ``bad_data`` for an unknown name."""
@@ -328,6 +378,31 @@ def open_session_log(session_id: str) -> Ledger | None:
     return Ledger.open(KIND_SESSION, session_id)
 
 
+def _log_origin(handle: Ledger) -> str | None:
+    """The crew log file's creation identity for *handle*, or ``None``.
+
+    A reuse (:func:`fold_session` ``since=``) folds new bytes onto a cached
+    checkpoint only when the file it folds now is the SAME one the checkpoint
+    came from. The identity combines three signals so no single one has to be
+    unique on its own: the header's ``created_at`` (stamped once at create, so a
+    recreated log under the same id gets a fresh value), and the file's device
+    and inode (which differ when a freed inode is NOT reused, and, combined with
+    ``created_at``, make a same-millisecond recreation onto a recycled inode the
+    only colliding case -- itself near-impossible). This catches what the seq
+    guard cannot: a recreated log that has already grown PAST the cached seq.
+    ``None`` is "unknown identity" and never matches, so a header without the
+    field or a stat failure falls back to the safe full rebuild.
+    """
+    created_at = getattr(handle.header, "created_at", None)
+    if not isinstance(created_at, int) or isinstance(created_at, bool):
+        return None
+    try:
+        stat = handle.path.stat()
+    except OSError:
+        return None
+    return f"{created_at}:{stat.st_dev}:{stat.st_ino}"
+
+
 def fold_session(
     session_id: str,
     names: Iterable[str] = PROJECTION_NAMES,
@@ -353,9 +428,17 @@ def fold_session(
     if handle is None:
         return empty_session(session_id, wanted)
     last_seq = handle.last_seq
+    origin = _log_origin(handle)
     reusable = (
         since is not None
         and since.session_id == session_id
+        # Same file: a recreated log gets a new inode, so a bundle folded from the
+        # old one is refused even after the new file grows past its cached seq --
+        # the case the seq guard below cannot catch on its own. ``origin is None``
+        # (stat failed, or an old cached bundle predating this field) never
+        # matches, so it falls back to the full rebuild.
+        and origin is not None
+        and since.origin == origin
         and since.last_seq <= last_seq
         and all(name in since.checkpoints for name in wanted)
     )
@@ -366,17 +449,47 @@ def fold_session(
     )
     from_seq = min((cp.last_seq for cp in base.values()), default=0) + 1
     if from_seq > last_seq:
-        return SessionProjections(session_id=session_id, last_seq=last_seq, checkpoints=base)
-    # ONE pass, materialized, because five folds consume the same entries and a
-    # generator would be exhausted by the first. The span is bounded by the
-    # caller: an incremental refresh reads what one batch appended.
-    fresh = tuple(handle.iter_from(from_seq, known=KNOWN_TYPES))
-    grown = {
-        name: advance(cp, tuple(entry for entry in fresh if entry.seq > cp.last_seq))
-        for name, cp in base.items()
-    }
+        return SessionProjections(
+            session_id=session_id, last_seq=last_seq, checkpoints=base, origin=origin
+        )
+    # ONE pass over the file, in bounded chunks. Five folds consume the same
+    # entries, so a bare generator would be exhausted by the first of them and
+    # some materialization is required -- but materializing the whole span holds
+    # an entire cold-folded log in memory, and a cold fold (no reusable bundle,
+    # so ``from_seq`` is 1) is the ordinary first read for any session. Chunking
+    # keeps the single pass and bounds what is held to ``FOLD_CHUNK_ENTRIES``.
+    # Folding a span in pieces is the same value as folding it whole: ``advance``
+    # is seq-anchored and each chunk is strictly after the last, which is the
+    # property the incremental-equals-from-scratch test pins at every split.
+    grown = dict(base)
+    chunk: list[Entry] = []
+    for entry in handle.iter_from(from_seq, known=KNOWN_TYPES):
+        chunk.append(entry)
+        if len(chunk) >= FOLD_CHUNK_ENTRIES:
+            grown = _advance_all(grown, chunk)
+            chunk.clear()
+    if chunk:
+        grown = _advance_all(grown, chunk)
     reached = max((cp.last_seq for cp in grown.values()), default=last_seq)
-    return SessionProjections(session_id=session_id, last_seq=reached, checkpoints=grown)
+    return SessionProjections(
+        session_id=session_id, last_seq=reached, checkpoints=grown, origin=origin
+    )
+
+
+def _advance_all(
+    checkpoints: dict[str, Checkpoint], chunk: Sequence[Entry]
+) -> dict[str, Checkpoint]:
+    """Every checkpoint advanced over the part of *chunk* it has not consumed.
+
+    The per-checkpoint filter is what lets one chunk serve five folds that may sit
+    at DIFFERENT seqs: a reused bundle can hold a status checkpoint further along
+    than its tools one, and ``advance`` refuses an entry at or below the seq it
+    already reached rather than silently double-counting it.
+    """
+    return {
+        name: advance(cp, tuple(entry for entry in chunk if entry.seq > cp.last_seq))
+        for name, cp in checkpoints.items()
+    }
 
 
 def read_projection(session_id: str, name: str) -> Projection:
@@ -552,6 +665,7 @@ def _usage_start() -> dict[str, Any]:
         "duration_ms": 0,
         "duration_turns": 0,
         "by_model": {},
+        "models_omitted": 0,
         "context_tokens": 0,
         "context_chars": 0,
         "context_blocks": 0,
@@ -569,10 +683,20 @@ def _usage_step(state: dict[str, Any], entry: Entry) -> None:
     if entry.type == "turn/completed":
         state["turns_completed"] += 1
         model = _as_str(data.get("model"))
-        per_model = state["by_model"].setdefault(
-            model, {"turns": 0, "credits": 0.0, "credits_turns": 0, "tokens": 0}
-        )
-        per_model["turns"] += 1
+        by_model = state["by_model"]
+        per_model = by_model.get(model)
+        if per_model is None:
+            if len(by_model) < MODEL_LIMIT:
+                per_model = {"turns": 0, "credits": 0.0, "credits_turns": 0, "tokens": 0}
+                by_model[model] = per_model
+            else:
+                # Past the model budget the whole-session totals below still count
+                # this turn exactly; only the per-model detail is dropped, and
+                # ``models_omitted`` says how many models were left out. This keeps
+                # the retained ``by_model`` bounded over a long session.
+                state["models_omitted"] += 1
+        if per_model is not None:
+            per_model["turns"] += 1
         credits = data.get("credits")
         # Absent credits are NOT zero: a synthesized closer reports no cost
         # because none was measured, and folding that in as 0.0 would state a
@@ -581,15 +705,17 @@ def _usage_step(state: dict[str, Any], entry: Entry) -> None:
         if isinstance(credits, (int, float)) and not isinstance(credits, bool):
             state["credits"] += float(credits)
             state["credits_turns"] += 1
-            per_model["credits"] += float(credits)
-            per_model["credits_turns"] += 1
+            if per_model is not None:
+                per_model["credits"] += float(credits)
+                per_model["credits_turns"] += 1
         tokens = data.get("tokens")
         if isinstance(tokens, dict):
             state["tokens_turns"] += 1
             for dimension in TOKEN_DIMENSIONS:
                 measured = _as_int(tokens.get(dimension))
                 state["tokens"][dimension] += measured
-                per_model["tokens"] += measured
+                if per_model is not None:
+                    per_model["tokens"] += measured
         duration = data.get("duration_ms")
         if isinstance(duration, int) and not isinstance(duration, bool):
             state["duration_ms"] += duration
@@ -645,6 +771,7 @@ def _usage_render(state: dict[str, Any]) -> dict[str, Any]:
             }
             for name, row in sorted(state["by_model"].items())
         },
+        "models_omitted": state["models_omitted"],
         "context": {
             "tokens": state["context_tokens"],
             "chars": state["context_chars"],
@@ -735,7 +862,9 @@ def _tools_start() -> dict[str, Any]:
         "elapsed_ms": 0,
         "by_name": {},
         "open": {},
+        "open_omitted": 0,
         "names_omitted": 0,
+        "names_omitted_saturated": False,
         "omitted_names": [],
     }
 
@@ -753,9 +882,17 @@ def _tool_row(state: dict[str, Any], name: str) -> dict[str, Any] | None:
     if len(by_name) >= TOOL_NAME_LIMIT:
         omitted: list[str] = state["omitted_names"]
         if name not in omitted:
-            state["names_omitted"] += 1
             if len(omitted) < TOOL_NAME_LIMIT:
                 omitted.append(name)
+                state["names_omitted"] += 1
+            else:
+                # Counting DISTINCT omitted names needs the dedup list, and it is
+                # spent. Counting anyway would count one name once per appearance
+                # -- a name's call and its completion both land here -- so the
+                # figure would exceed the number of names that exist. Instead the
+                # count stops being added to and says it is a floor: exact while
+                # the budget held, and honestly incomplete after.
+                state["names_omitted_saturated"] = True
         return None
     row = {
         "calls": 0,
@@ -765,6 +902,7 @@ def _tool_row(state: dict[str, Any], name: str) -> dict[str, Any] | None:
         "last_status": None,
         "last_time": None,
         "servers": [],
+        "servers_over": [],
     }
     by_name[name] = row
     return row
@@ -781,20 +919,38 @@ def _tools_step(state: dict[str, Any], entry: Entry) -> None:
             row["last_time"] = entry.time
             server = data.get("server")
             if isinstance(server, str) and server and server not in row["servers"]:
-                row["servers"].append(server)
-        call_id = data.get("call_id")
+                if len(row["servers"]) < SERVERS_PER_TOOL_LIMIT:
+                    row["servers"].append(server)
+                elif server not in row["servers_over"]:
+                    # Count DISTINCT omitted servers, not repeated calls through
+                    # one of them. The dedup list is itself capped, so it cannot
+                    # grow without bound; past its cap a further name is not
+                    # tracked and so is not counted, which understates rather than
+                    # inflates.
+                    if len(row["servers_over"]) < SERVERS_PER_TOOL_LIMIT:
+                        row["servers_over"].append(server)
+        call_id = _as_id(data.get("call_id"))
         # An empty call_id is what the declaration allows when the frame carried
         # none, and it identifies NOTHING: keying the open-call map by it would
         # make every such call the same call, so one completion would close a
-        # different call's frame. Those are counted and left unpaired.
-        if isinstance(call_id, str) and call_id:
-            state["open"][call_id] = {
-                "call_id": call_id,
-                "name": name,
-                "turn": _as_int(data.get("turn")),
-                "time": entry.time,
-                "seq": entry.seq,
-            }
+        # different call's frame. An id past ``ID_LIMIT`` is treated the same way,
+        # because it is retained here and its size is part of the bound. Those are
+        # counted and left unpaired.
+        if call_id:
+            if call_id in state["open"] or len(state["open"]) < OPEN_RETAIN_LIMIT:
+                state["open"][call_id] = {
+                    "call_id": call_id,
+                    "name": name,
+                    "turn": _as_int(data.get("turn")),
+                    "time": entry.time,
+                    "seq": entry.seq,
+                }
+            else:
+                # The retained open-call map is full of never-matched ids. A
+                # further distinct one is counted and dropped rather than kept,
+                # so the checkpoint stays bounded; its later completion reads as
+                # unmatched, which it effectively is.
+                state["open_omitted"] += 1
         else:
             state["unidentified_calls"] += 1
     elif entry.type == "tool/completed":
@@ -818,8 +974,11 @@ def _tools_step(state: dict[str, Any], entry: Entry) -> None:
             row["last_time"] = entry.time
             if failed:
                 row["errors"] += 1
-        call_id = data.get("call_id")
-        if isinstance(call_id, str) and call_id:
+        # The SAME coercion as the open side, so the two agree on what an identity
+        # is. If a completion paired on a raw id while the call retained a coerced
+        # one, an over-long id would look unmatched here and unbounded there.
+        call_id = _as_id(data.get("call_id"))
+        if call_id:
             if state["open"].pop(call_id, None) is None:
                 state["unmatched_completions"] += 1
 
@@ -834,6 +993,7 @@ def _tools_render(state: dict[str, Any]) -> dict[str, Any]:
         "open": len(open_calls),
         "open_calls": [dict(call) for call in open_calls[:OPEN_LIST_LIMIT]],
         "open_calls_omitted": max(0, len(open_calls) - OPEN_LIST_LIMIT),
+        "open_dropped": state["open_omitted"],
         "unidentified_calls": state["unidentified_calls"],
         "unmatched_completions": state["unmatched_completions"],
         "elapsed_ms": state["elapsed_ms"],
@@ -846,10 +1006,15 @@ def _tools_render(state: dict[str, Any]) -> dict[str, Any]:
                 "last_status": row["last_status"],
                 "last_time": row["last_time"],
                 "servers": list(row["servers"]),
+                "servers_omitted": len(row["servers_over"]),
             }
             for name, row in sorted(state["by_name"].items())
         },
         "names_omitted": state["names_omitted"],
+        # True once the dedup budget is spent: ``names_omitted`` is then a floor,
+        # not a total. Without this a reader cannot tell an exact count from a
+        # stalled one.
+        "names_omitted_saturated": state["names_omitted_saturated"],
     }
 
 
@@ -866,25 +1031,32 @@ def _approvals_start() -> dict[str, Any]:
         "unmatched_decisions": 0,
         "by_decision": {},
         "pending": {},
+        "pending_omitted": 0,
         "last": None,
     }
 
 
 def _approvals_step(state: dict[str, Any], entry: Entry) -> None:
     data = entry.data
-    approval_id = data.get("approval_id")
-    identified = isinstance(approval_id, str) and bool(approval_id)
+    approval_id = _as_id(data.get("approval_id"))
+    identified = bool(approval_id)
     if entry.type == "approval/requested":
         state["requested"] += 1
         if identified:
-            state["pending"][approval_id] = {
-                "approval_id": approval_id,
-                "tool": _as_str(data.get("tool")),
-                "reason": _as_str(data.get("reason")),
-                "turn": _as_int(data.get("turn")),
-                "time": entry.time,
-                "seq": entry.seq,
-            }
+            if approval_id in state["pending"] or len(state["pending"]) < OPEN_RETAIN_LIMIT:
+                state["pending"][approval_id] = {
+                    "approval_id": approval_id,
+                    "tool": _as_str(data.get("tool")),
+                    "reason": _as_str(data.get("reason")),
+                    "turn": _as_int(data.get("turn")),
+                    "time": entry.time,
+                    "seq": entry.seq,
+                }
+            else:
+                # Retained pending map full of never-decided requests: count and
+                # drop the further one so the checkpoint stays bounded. A later
+                # decision for a dropped id reads as unmatched.
+                state["pending_omitted"] += 1
         else:
             # Same rule as an empty tool call_id: an unidentified request cannot
             # be paired with a decision without pairing it with the wrong one.
@@ -916,6 +1088,7 @@ def _approvals_render(state: dict[str, Any]) -> dict[str, Any]:
         "pending": len(pending),
         "pending_requests": [dict(item) for item in pending[:OPEN_LIST_LIMIT]],
         "pending_omitted": max(0, len(pending) - OPEN_LIST_LIMIT),
+        "pending_dropped": state["pending_omitted"],
         "unidentified_requests": state["unidentified_requests"],
         "unmatched_decisions": state["unmatched_decisions"],
         "by_decision": dict(sorted(state["by_decision"].items())),
@@ -932,14 +1105,37 @@ def _as_int(value: Any) -> int:
 
 
 def _as_str(value: Any) -> str:
-    """*value* when it is a string, else the empty one.
+    """*value* when it is a string, cut to ``TEXT_LIMIT``, else the empty one.
 
     Every ``data`` field these folds read comes off bytes a reader does not
     control, so the shape is checked here rather than trusted from the type
     declaration: a declaration binds the WRITER, and a damaged or planted line is
     exactly the input that ignores it.
+
+    The LENGTH is part of that shape. Every caller here retains what it gets --
+    as a ``by_name`` key, a server in a row, an approval's reason -- and a count
+    cap bounds how MANY are kept, never how big each one is, so one coercion
+    point is where the size bound belongs rather than at each of the dozen
+    retention sites that would each have to remember it.
     """
-    return value if isinstance(value, str) else ""
+    if not isinstance(value, str):
+        return ""
+    return value[:TEXT_LIMIT]
+
+
+def _as_id(value: Any) -> str:
+    """*value* when it is a string short enough to PAIR on, else the empty one.
+
+    An identity is not a label and is deliberately not truncated: two distinct
+    ids sharing a ``TEXT_LIMIT``-character head would collapse into one identity,
+    and a completion would then close a different call's frame -- turning a
+    bounded-memory fix into a wrong answer. Past ``ID_LIMIT`` an id identifies
+    nothing, which is the same thing an absent one does, so it takes the same
+    path: counted, and left unpaired.
+    """
+    if not isinstance(value, str) or not value or len(value) > ID_LIMIT:
+        return ""
+    return value
 
 
 _FOLDS: Final[dict[str, _Fold]] = {

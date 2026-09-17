@@ -52,7 +52,13 @@ already folded would have its totals counted twice, and a caller holding a
 checkpoint for a unit that was removed and recreated would have the whole new log
 swallowed as already-folded. So it refuses with `bad_data` and naming the
 collision, and `fold_session` handles the recreated-unit case itself by
-discarding a bundle whose seq is ahead of the file.
+discarding a bundle whose seq is ahead of the file. It also carries the log
+file's creation identity (`SessionProjections.origin`, the header's `createdAt`)
+and reuses a bundle only when that identity still matches: a log removed and
+recreated that has already grown PAST the cached seq passes the seq guard, so
+without the identity check its stale state would be folded onto a different
+file's bytes. An unknown identity never matches, so an older bundle without the
+field falls back to a full rebuild.
 
 **Absent is never read as zero.** `turn/completed` carries `credits` and `tokens`
 only on a provider-reported close, so a synthesized closer omits them. A total
@@ -69,15 +75,54 @@ memory would make two readers of one file disagree about one turn.
 **An unpairable id is counted, never paired.** `tool/*.call_id` and
 `approval/*.approval_id` may be empty, and an empty id identifies nothing --
 keying a map by it would make every such call the same call, so one completion
-would close a different call's frame. Those are counted
+would close a different call's frame. An id longer than `ID_LIMIT` takes the same
+path for the same reason: it is retained, so its size is part of the bound, and it
+cannot be shortened to fit because two distinct ids sharing a head would collapse
+into one identity. Both sides of a pair coerce the id identically, so the call and
+its completion always agree on what an identity is. Those are counted
 (`tools.unidentified_calls`, `approvals.unidentified_requests`) and left unpaired.
 
-**Every value is bounded.** A projection is pushed over a socket on each growth,
-so its size cannot depend on how long the session ran: `timeline` keeps the
-newest `TIMELINE_LIMIT` moments and reports how many it dropped, `tools` details
-`TOOL_NAME_LIMIT` names while keeping the totals exact and counting the rest in
-`names_omitted`, and the open-call and pending-approval lists are capped with
-their own omitted counts.
+**Every value is bounded, in count and in size.** A projection is pushed over a
+socket on each growth, so its size cannot depend on how long the session ran:
+`timeline` keeps the newest `TIMELINE_LIMIT` moments and reports how many it
+dropped, `tools` details `TOOL_NAME_LIMIT` names while keeping the totals exact
+and counting the rest in `names_omitted`, and the open-call and pending-approval
+lists are capped with their own omitted counts. The bound is on the RETAINED
+checkpoint state, not only the rendered value: a session that leaks never-matched
+`call_id`s or `approval_id`s stops retaining them past `OPEN_RETAIN_LIMIT`
+(counted in `open_dropped`/`pending_dropped`), a single tool called through many
+servers caps its retained server names at `SERVERS_PER_TOOL_LIMIT` and counts the
+DISTINCT omitted ones in `servers_omitted`, and `usage` details at most
+`MODEL_LIMIT` models while keeping the whole-session totals exact and counting
+the rest in `models_omitted` -- so the deep-copied, cached checkpoint cannot
+grow without bound over a long-lived session.
+
+A cap on HOW MANY values are retained bounds nothing on its own, because every
+one of those values is a string off the wire. Each retained LABEL -- a tool or
+model name, a server, an approval's tool or reason -- is cut to `TEXT_LIMIT` at
+the single point where the fold coerces it, so a handful of near-64-KiB strings
+cannot outweigh the entry budget they are counted against. A label is a display
+value, so keeping its head is the honest bound; an identity is not, which is why
+it is refused rather than cut.
+
+A count that is deduplicated against a capped list stops being exact when that
+list fills, and saying so is part of the bound. Once `tools` has spent its dedup
+budget a further omitted name is no longer recognised as already-seen, so counting
+it again would count one name once per appearance -- a call and its completion
+both reach that path -- and the figure would climb past the number of names that
+exist. `names_omitted` therefore stops at the budget and `names_omitted_saturated`
+says it has become a floor rather than a total.
+
+**A cold fold holds a chunk, not the file.** Five folds consume the same entries,
+so a single generator would be exhausted by the first of them and the span has to
+be materialized. Materializing the WHOLE span is what a cold fold does most often
+-- with no reusable bundle the range starts at seq 1, which is the ordinary first
+read for any session -- so the pass is taken `FOLD_CHUNK_ENTRIES` at a time: one
+pass over the file, with what is held bounded. Folding a span in pieces is the
+same value as folding it whole, because `advance` is seq-anchored and each chunk
+is strictly after the last, and each checkpoint takes only the part of a chunk it
+has not already consumed -- which is what lets one chunk serve five folds sitting
+at different seqs.
 
 ## 3. The five projections
 
@@ -150,6 +195,12 @@ thread: `notify` hands the id to the loop and returns. It then coalesces for
 `COALESCE_SECONDS`, folds all five projections from ONE incremental read of the
 entries that arrived, and sends a frame only for a projection whose `seq` moved --
 re-sending an unchanged value would spend a socket write to say nothing.
+
+A flush pass runs to completion before the next one starts. A growth arriving
+during a slow fold does not launch an overlapping pass: two `_publish` for one
+session would otherwise share the same prior bundle and race the cache write, so
+an older `seq` could be broadcast last. When a pass finishes with more work
+marked, it schedules the next pass itself.
 
 Fold state is cached for at most `MAX_CACHED_SESSIONS` sessions; an evicted
 session folds from the start on its next growth. When no dashboard user has a

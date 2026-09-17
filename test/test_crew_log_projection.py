@@ -567,6 +567,7 @@ def test_approvals_matches_a_request_to_its_decision():
         "pending": 0,
         "pending_requests": [],
         "pending_omitted": 0,
+        "pending_dropped": 0,
         "unidentified_requests": 0,
         "unmatched_decisions": 0,
         "by_decision": {"allow": 1},
@@ -769,3 +770,375 @@ def test_a_ref_on_a_session_entry_is_left_to_the_page_path():
     value = crew_log.fold_timeline(_entries(handle))
     assert value["moments"][-1]["type"] == "subagent/spawned"
     assert "ref" not in value["moments"][-1]
+
+
+# --------------------------------------------------------------------------- #
+# bounded state (a-bound-bounds-every-field-it-retains)
+# --------------------------------------------------------------------------- #
+
+
+def test_tools_open_map_is_bounded_when_calls_are_never_completed():
+    """Never-matched open tool calls do not grow the checkpoint without bound.
+
+    A session that opens far more distinct calls than it completes must keep the
+    retained ``open`` map bounded and count the ones it dropped, the same way the
+    render already caps the listed window.
+    """
+    handle = _log()
+    _opened(handle)
+    overflow = crew_log.OPEN_RETAIN_LIMIT + 25
+    for index in range(overflow):
+        handle.append(
+            "tool/called",
+            {
+                "turn": 1,
+                "call_id": f"open-{index}",
+                "name": "fs_read",
+                "server": "core",
+                "kind": "mcp",
+            },
+            src=GATEWAY,
+        )
+    bundle = crew_log.fold_session(SESSION, ("tools",))
+    state = bundle.checkpoints["tools"].state
+    assert len(state["open"]) == crew_log.OPEN_RETAIN_LIMIT
+    assert state["open_omitted"] == overflow - crew_log.OPEN_RETAIN_LIMIT
+    value = bundle.projection("tools").value
+    assert value["open"] == crew_log.OPEN_RETAIN_LIMIT
+    assert value["open_dropped"] == overflow - crew_log.OPEN_RETAIN_LIMIT
+
+
+def test_approvals_pending_map_is_bounded_when_requests_are_never_decided():
+    """Never-decided approval requests keep the retained ``pending`` map bounded."""
+    handle = _log()
+    _opened(handle)
+    overflow = crew_log.OPEN_RETAIN_LIMIT + 10
+    for index in range(overflow):
+        handle.append(
+            "approval/requested",
+            {"turn": 1, "approval_id": f"ap-{index}", "tool": "shell", "reason": "x"},
+            src=GATEWAY,
+        )
+    bundle = crew_log.fold_session(SESSION, ("approvals",))
+    state = bundle.checkpoints["approvals"].state
+    assert len(state["pending"]) == crew_log.OPEN_RETAIN_LIMIT
+    assert state["pending_omitted"] == overflow - crew_log.OPEN_RETAIN_LIMIT
+    assert bundle.projection("approvals").value["pending_dropped"] == (
+        overflow - crew_log.OPEN_RETAIN_LIMIT
+    )
+
+
+def test_usage_by_model_is_bounded_when_many_models_appear():
+    """Many distinct models keep the retained ``by_model`` map bounded while the
+    whole-session totals stay exact."""
+    handle = _log()
+    _opened(handle)
+    overflow = crew_log.MODEL_LIMIT + 15
+    for turn in range(1, overflow + 1):
+        _turn(handle, turn, credits=1.0, model=f"model-{turn}")
+    value = crew_log.fold_session(SESSION, ("usage",)).projection("usage").value
+    assert len(value["by_model"]) == crew_log.MODEL_LIMIT
+    assert value["models_omitted"] == overflow - crew_log.MODEL_LIMIT
+    # The whole-session totals count every turn, budget or not.
+    assert value["turns"]["completed"] == overflow
+    assert value["turns"]["credits_reported"] == overflow
+    assert value["credits"] == float(overflow)
+
+
+def test_tool_row_servers_are_bounded_per_name():
+    """One tool called through many distinct servers bounds its ``servers`` list."""
+    handle = _log()
+    _opened(handle)
+    overflow = crew_log.SERVERS_PER_TOOL_LIMIT + 8
+    for index in range(overflow):
+        handle.append(
+            "tool/called",
+            {
+                "turn": 1,
+                "call_id": f"c{index}",
+                "name": "fs_read",
+                "server": f"srv-{index}",
+                "kind": "mcp",
+            },
+            src=GATEWAY,
+        )
+    row = crew_log.fold_session(SESSION, ("tools",)).projection("tools").value["by_name"]["fs_read"]
+    assert len(row["servers"]) == crew_log.SERVERS_PER_TOOL_LIMIT
+    assert row["servers_omitted"] == overflow - crew_log.SERVERS_PER_TOOL_LIMIT
+
+
+def test_servers_omitted_counts_distinct_servers_not_repeated_calls():
+    """Repeated calls through one over-budget server count as one omitted server."""
+    handle = _log()
+    _opened(handle)
+    # Fill the listed budget with distinct servers, then call ONE extra server
+    # many times: it is one omitted server, not many.
+    for index in range(crew_log.SERVERS_PER_TOOL_LIMIT):
+        handle.append(
+            "tool/called",
+            {
+                "turn": 1,
+                "call_id": f"c{index}",
+                "name": "fs_read",
+                "server": f"srv-{index}",
+                "kind": "mcp",
+            },
+            src=GATEWAY,
+        )
+    for repeat in range(5):
+        handle.append(
+            "tool/called",
+            {
+                "turn": 1,
+                "call_id": f"x{repeat}",
+                "name": "fs_read",
+                "server": "overflow",
+                "kind": "mcp",
+            },
+            src=GATEWAY,
+        )
+    row = crew_log.fold_session(SESSION, ("tools",)).projection("tools").value["by_name"]["fs_read"]
+    assert row["servers_omitted"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# recreated-then-grown reuse (residual/crash-data-loss-corruption)
+# --------------------------------------------------------------------------- #
+
+
+def test_fold_session_rebuilds_when_the_bundle_origin_does_not_match_the_file():
+    """A bundle whose origin differs from the current file is not reused.
+
+    This is the removed-and-recreated case that has already grown PAST the cached
+    seq: the seq guard (``since.last_seq <= last_seq``) passes because the file is
+    longer than the stale bundle, so without the file-identity check the old
+    file's state would be folded over the new file's bytes. A recreated log has a
+    different origin (a fresh ``created_at`` and/or inode), so the reuse is
+    refused and the fold rebuilds from the start. Filesystem-free so it behaves
+    the same on every platform.
+    """
+    handle = _log()
+    _opened(handle)
+    for turn in range(1, 6):
+        _turn(handle, turn, credits=1.0)
+
+    # A stale bundle from a DIFFERENT file: real checkpoints (so a wrong reuse
+    # would fold visibly wrong totals) but a foreign origin and a seq below the
+    # current head, the exact recreated-then-grown shape.
+    other = _log("s-other-origin")
+    _opened(other)
+    for turn in (1, 2):
+        _turn(other, turn, credits=99.0)
+    foreign = crew_log.fold_session("s-other-origin")
+    stale = crew_log.SessionProjections(
+        session_id=SESSION,
+        last_seq=foreign.last_seq,
+        checkpoints=foreign.checkpoints,
+        origin="not-this-file",
+    )
+    assert stale.last_seq < handle.last_seq  # seq guard alone would pass
+
+    rebuilt = crew_log.fold_session(SESSION, since=stale)
+    honest = crew_log.fold_usage(_entries(handle))
+    assert rebuilt.projection("usage").value == honest
+    assert rebuilt.origin is not None and rebuilt.origin != stale.origin
+
+
+def test_fold_session_reuses_the_bundle_when_the_file_is_the_same():
+    """The origin guard does not defeat a legitimate incremental reuse."""
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=1.0)
+    first = crew_log.fold_session(SESSION, ledger=handle)
+    _turn(handle, 2, credits=1.0)
+    second = crew_log.fold_session(SESSION, since=first, ledger=handle)
+    assert second.origin == first.origin
+    assert second.projection("usage").value == crew_log.fold_usage(_entries(handle))
+
+
+# --------------------------------------------------------------------------- #
+# bounds on what a fold RETAINS, and on what one pass holds
+# --------------------------------------------------------------------------- #
+
+
+def test_a_cold_fold_crossing_the_chunk_boundary_matches_the_whole_file(monkeypatch):
+    """Folding a span in chunks is the same value as folding it whole.
+
+    ``fold_session`` reads the log one bounded chunk at a time so a cold fold of a
+    long log does not hold the whole thing in memory. That is only safe if the
+    chunk boundary is invisible in the result, so this drives a log well past
+    ``FOLD_CHUNK_ENTRIES``, compares against the from-scratch fold, AND counts the
+    passes -- otherwise the test would still pass if the chunking were removed.
+    """
+    handle = _log()
+    _opened(handle)
+    # Two entries per tool, so this clears the chunk boundary several times over.
+    for index in range(crew_log.FOLD_CHUNK_ENTRIES):
+        _tool(handle, 1, f"c{index}", "fs_read")
+    assert handle.last_seq > crew_log.FOLD_CHUNK_ENTRIES
+
+    passes = []
+    real_advance_all = crew_log._advance_all
+
+    def counting(checkpoints, chunk):
+        passes.append(len(chunk))
+        return real_advance_all(checkpoints, chunk)
+
+    monkeypatch.setattr(crew_log, "_advance_all", counting)
+    chunked = crew_log.fold_session(SESSION, ("tools",)).projection("tools").value
+    whole = crew_log.fold_tools(_entries(handle))
+    assert chunked == whole
+    assert chunked["calls"] == crew_log.FOLD_CHUNK_ENTRIES
+    # More than one pass, and no pass bigger than the chunk bound.
+    assert len(passes) > 1
+    assert max(passes) <= crew_log.FOLD_CHUNK_ENTRIES
+
+
+def test_an_over_long_call_id_is_counted_and_not_retained():
+    """An id too big to retain identifies nothing, exactly like an absent one.
+
+    A ``call_id`` comes off the wire and nothing on that path caps its length, so
+    retaining it raw would let a few frames outweigh the whole entry budget the
+    ``open`` map is counted against. It cannot be TRUNCATED to fit -- two distinct
+    ids sharing a head would become one identity and a completion would close the
+    wrong frame -- so it takes the unidentified path instead.
+    """
+    handle = _log()
+    _opened(handle)
+    handle.append(
+        "tool/called",
+        {
+            "turn": 1,
+            "call_id": "x" * (crew_log.ID_LIMIT + 1),
+            "name": "fs_read",
+            "server": "core",
+            "kind": "mcp",
+        },
+        src=GATEWAY,
+    )
+    value = crew_log.fold_tools(_entries(handle))
+    assert value["calls"] == 1
+    assert value["unidentified_calls"] == 1
+    assert value["open"] == 0
+
+    state = crew_log.fold_session(SESSION, ("tools",)).checkpoints["tools"].state
+    assert state["open"] == {}
+    # An id one character shorter is ordinary and IS retained, so the refusal is
+    # the length and not the shape.
+    other = _log("s-id-edge")
+    _opened(other)
+    other.append(
+        "tool/called",
+        {
+            "turn": 1,
+            "call_id": "x" * crew_log.ID_LIMIT,
+            "name": "fs_read",
+            "server": "core",
+            "kind": "mcp",
+        },
+        src=GATEWAY,
+    )
+    kept = crew_log.fold_tools(_entries(other))
+    assert kept["unidentified_calls"] == 0
+    assert kept["open"] == 1
+
+
+def test_an_over_long_call_id_on_a_completion_does_not_inflate_unmatched():
+    """The completion side coerces the id the same way the call side does.
+
+    If a completion paired on the raw id while the call retained a coerced one,
+    the two would disagree about what an identity is: the same frame would be
+    unbounded on one side and reported unmatched on the other.
+    """
+    handle = _log()
+    _opened(handle)
+    handle.append(
+        "tool/completed",
+        {
+            "turn": 1,
+            "call_id": "y" * (crew_log.ID_LIMIT + 1),
+            "name": "fs_read",
+            "server": "core",
+            "status": "completed",
+        },
+        src=GATEWAY,
+    )
+    value = crew_log.fold_tools(_entries(handle))
+    assert value["completed"] == 1
+    assert value["unmatched_completions"] == 0
+
+
+def test_an_over_long_approval_id_is_counted_and_not_retained():
+    """The pending-approval map bounds its identity the same way tools do."""
+    handle = _log()
+    _opened(handle)
+    handle.append(
+        "approval/requested",
+        {
+            "turn": 1,
+            "approval_id": "z" * (crew_log.ID_LIMIT + 1),
+            "tool": "execute_bash",
+            "reason": "writes a file",
+        },
+        src=GATEWAY,
+    )
+    value = crew_log.fold_approvals(_entries(handle))
+    assert value["requested"] == 1
+    assert value["unidentified_requests"] == 1
+    assert value["pending"] == 0
+
+
+def test_names_omitted_stops_counting_rather_than_counting_a_name_twice():
+    """Past the dedup budget the count says it is a floor instead of inflating.
+
+    ``names_omitted`` is a count of DISTINCT names left out of the detail, and it
+    is deduplicated against a list that is itself capped. A name arriving once the
+    list is full is not recognised as already-seen, so counting it again would
+    count one name once per appearance -- a call and its completion both reach
+    here -- and the figure would climb past the number of names that exist.
+    """
+    handle = _log()
+    _opened(handle)
+    distinct = crew_log.TOOL_NAME_LIMIT * 3
+    for index in range(distinct):
+        _tool(handle, 1, f"c{index}", f"tool_{index:05d}")
+    value = crew_log.fold_tools(_entries(handle))
+
+    omitted_names = distinct - crew_log.TOOL_NAME_LIMIT
+    assert len(value["by_name"]) == crew_log.TOOL_NAME_LIMIT
+    # The count never exceeds the number of names actually left out -- the whole
+    # point -- and stops at the dedup budget, saying so.
+    assert value["names_omitted"] <= omitted_names
+    assert value["names_omitted"] == crew_log.TOOL_NAME_LIMIT
+    assert value["names_omitted_saturated"] is True
+    # Totals stay exact regardless.
+    assert value["calls"] == distinct
+    assert value["completed"] == distinct
+
+
+def test_names_omitted_is_exact_and_unsaturated_inside_the_dedup_budget():
+    """Below the budget the count is a total, not a floor."""
+    handle = _log()
+    _opened(handle)
+    extra = 4
+    for index in range(crew_log.TOOL_NAME_LIMIT + extra):
+        _tool(handle, 1, f"c{index}", f"tool_{index:05d}")
+    value = crew_log.fold_tools(_entries(handle))
+    assert value["names_omitted"] == extra
+    assert value["names_omitted_saturated"] is False
+
+
+def test_a_retained_label_is_cut_to_the_text_limit():
+    """A label is retained, so its SIZE is part of the bound on the state.
+
+    Unlike an identity a label is a display value, so the honest bound keeps its
+    head rather than dropping the row: the totals stay attributable and the state
+    stays bounded.
+    """
+    handle = _log()
+    _opened(handle)
+    _tool(handle, 1, "c1", "n" * (crew_log.TEXT_LIMIT * 20))
+    value = crew_log.fold_tools(_entries(handle))
+    (name,) = value["by_name"]
+    assert len(name) == crew_log.TEXT_LIMIT
+    assert value["by_name"][name]["calls"] == 1

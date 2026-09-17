@@ -4,7 +4,8 @@ Two reads and one push, which is the split RFC section 5 asks for: the backend
 folds and cuts pages, the frontend renders and pages and never folds (NFR-2).
 
 - ``GET /api/sessions/{id}/crew-log?from=&to=`` -- the entries in a seq range,
-  with every ``ref`` on the page resolved (FR-4).
+  with up to ``MAX_PAGE_REFS`` of the page's refs resolved and the rest reported
+  in ``refs_unresolved`` (FR-4).
 - ``GET /api/sessions/{id}/crew-log/projection/{name}`` -- one fold's value and
   the ``seq`` it was folded through (FR-5).
 - a ``session_projection`` frame per projection whose value moves, pushed when a
@@ -41,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import OrderedDict
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, Final
 
 from aiohttp import web
@@ -51,13 +53,12 @@ from kiro_crew.dashboard.handlers._shared import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
-    from kiro_crew.ledger import projection as crew_log_module
     from kiro_crew.ledger.errors import LedgerError
 
 logger = logging.getLogger(__name__)
 
 
-def _crew_log() -> "crew_log_module":
+def _crew_log() -> ModuleType:
     """The projection module, loaded the first time a call actually needs it."""
     from kiro_crew.ledger import projection
 
@@ -258,6 +259,13 @@ class CrewLogPublisher:
         self._dirty: set[str] = set()
         self._bundles: "OrderedDict[str, Any]" = OrderedDict()
         self._scheduled = False
+        # A flush pass runs to completion before the next one starts. Without
+        # this, a growth arriving during a slow fold would schedule a second
+        # overlapping pass, and two ``_publish`` for one session would share the
+        # same ``before`` bundle and race the cache write, so an older seq could
+        # land and be broadcast last. When a pass finishes with more work marked,
+        # it schedules the next pass itself.
+        self._flushing = False
 
     # -- writer thread ------------------------------------------------------ #
 
@@ -296,12 +304,27 @@ class CrewLogPublisher:
         loop = self._loop
         if loop is None:
             return
+        # A pass is already running. It will re-schedule when it finishes if the
+        # dirty set is non-empty, so starting a second, overlapping pass here is
+        # exactly the race that would let an older seq land last.
+        if self._flushing:
+            return
+        self._flushing = True
         task = loop.create_task(self._flush())
         # Held only so the loop keeps a reference while it runs; the callback
         # drops it and reports a failure rather than letting it be swallowed.
         task.add_done_callback(self._finished)
 
     def _finished(self, task: "asyncio.Task[None]") -> None:
+        self._flushing = False
+        # A growth that arrived mid-flush left the dirty set non-empty and found
+        # ``_scheduled`` still true (so it did not re-arm the timer); pick it up
+        # now that this pass is done, on the next coalesce tick.
+        if self._dirty and not self._scheduled:
+            self._scheduled = True
+            loop = self._loop
+            if loop is not None:
+                loop.call_later(COALESCE_SECONDS, self._run)
         if task.cancelled():
             return
         error = task.exception()

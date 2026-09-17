@@ -497,10 +497,14 @@ def test_this_module_does_not_load_the_storage_package_at_import():
         "print(json.dumps(sorted(k for k in sys.modules if k.startswith('kiro_crew.ledger'))))"
     )
     done = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [os.path.abspath(sys.executable), "-c", probe],
+        [os.path.abspath(sys.executable), "-B", "-c", probe],
+        # Inherit the full environment (Windows needs SYSTEMROOT and friends to
+        # start the interpreter at all) and layer the probe's own values on top.
+        # ``-B`` already stops the child writing bytecode into the checkout, so no
+        # env var is relied on for that.
         env={
+            **os.environ,
             "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-            "PATH": os.environ.get("PATH", ""),
             "KIROCREW_HOME": os.environ.get("KIROCREW_HOME", ""),
         },
         capture_output=True,
@@ -510,3 +514,35 @@ def test_this_module_does_not_load_the_storage_package_at_import():
     )
     assert done.returncode == 0, done.stderr[-2000:]
     assert json.loads(done.stdout.strip().splitlines()[-1]) == []
+
+
+def test_run_does_not_start_an_overlapping_flush_while_one_is_in_flight():
+    """A second scheduled pass must not run concurrently with a slow flush.
+
+    Two overlapping ``_publish`` for one session would share the same ``before``
+    bundle and race the cache write, so an older seq could be broadcast last.
+    """
+    publisher = routes.CrewLogPublisher(_Sockets())
+    loop = MagicMock()
+    publisher.bind(loop)
+    publisher._flushing = True
+    publisher._scheduled = True
+    publisher._run()
+    loop.create_task.assert_not_called()
+
+
+def test_finished_reschedules_when_work_arrived_mid_flush():
+    """A growth marked during a flush is picked up once the pass finishes."""
+    publisher = routes.CrewLogPublisher(_Sockets())
+    loop = MagicMock()
+    publisher.bind(loop)
+    publisher._flushing = True
+    publisher._dirty.add(SESSION)
+    publisher._scheduled = False
+    done = MagicMock()
+    done.cancelled.return_value = False
+    done.exception.return_value = None
+    publisher._finished(done)
+    assert publisher._flushing is False
+    assert publisher._scheduled is True
+    loop.call_later.assert_called_once()
