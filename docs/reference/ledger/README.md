@@ -14,6 +14,9 @@ unit's history.
 These pages say WHAT the format is. For WHY it is shaped this way, read
 [`ledger-core.md`](../../system-specs/modules/ledger-core.md) and
 [`session-ledger-emitter.md`](../../system-specs/modules/session-ledger-emitter.md).
+For how a session's file is FOLDED into the views a reader sees, and the routes
+and frame that serve them, read
+[`crew-log-projection.md`](../../system-specs/modules/crew-log-projection.md).
 
 ## Contents
 
