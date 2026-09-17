@@ -184,6 +184,135 @@ class TestCreatedByRecentSessionRestore:
         assert restore_recent_sessions(state, window_minutes=60) == 1
         assert state._slots["chat-1-worker"]._created_by == "member-autofix"
 
+    def test_recent_session_restore_rehydrates_the_frozen_creator_sid(self, tmp_path, monkeypatch):
+        # The creator's ACP session id is frozen on the child at mint so its
+        # session/opened lineage cites the creator ledger that was live then. A
+        # restart between mint and the child's first turn must not lose it: the
+        # child would otherwise write its lineage with the sid absent, and an
+        # append-only entry is never rewritten.
+        import json as _json
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kiro_crew.dashboard.chat import restore_recent_sessions
+        from kiro_crew.dashboard.state import DashboardState
+        from kiro_crew.history import ConversationLog
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        meta_line = {
+            "_type": "metadata",
+            "created_at": "2026-03-23T10:00:00",
+            "last_consolidated": 0,
+            "title": "Worker",
+            "agent": "kirocrew",
+            "created_by": "member-autofix",
+            "created_by_sid": "acp-sess-creator-at-mint",
+        }
+        rows = [
+            _json.dumps(meta_line),
+            _json.dumps({"role": "user", "content": "task", "ts": "2026-03-23T10:00:00"}),
+        ]
+        path = tmp_path / "dashboard_chat-1-worker.jsonl"
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        path.touch()
+
+        sessions = MagicMock(count=0)
+        sessions.get_pid = MagicMock(return_value=None)
+        sessions.remove = AsyncMock()
+        state = DashboardState(
+            sessions=sessions,
+            crons=MagicMock(
+                list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})
+            ),
+            lessons=MagicMock(load_all=MagicMock(return_value=[])),
+            start_time=0.0,
+            conversation_log=ConversationLog(base_dir=tmp_path),
+        )
+        assert restore_recent_sessions(state, window_minutes=60) == 1
+        assert state._slots["chat-1-worker"]._created_by_sid == "acp-sess-creator-at-mint"
+
+    def test_frozen_creator_sid_survives_save_and_rehydrate(self, tmp_path, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kiro_crew.dashboard.chat_persistence import (
+            _rehydrate_slot_from_history,
+            _save_slot_to_history,
+        )
+        from kiro_crew.dashboard.state import DashboardState
+        from kiro_crew.history import ConversationLog
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        sessions = MagicMock(count=0)
+        sessions.get_pid = MagicMock(return_value=None)
+        sessions.remove = AsyncMock()
+        state = DashboardState(
+            sessions=sessions,
+            crons=MagicMock(
+                list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})
+            ),
+            lessons=MagicMock(load_all=MagicMock(return_value=[])),
+            start_time=0.0,
+            conversation_log=ConversationLog(base_dir=tmp_path),
+        )
+        slot = state.get_or_create_slot("chat-1-worker")
+        slot._created_by = "member-autofix"
+        slot._created_by_sid = "acp-sess-creator-at-mint"
+        slot.append("user", "task")
+        slot.drain()
+
+        _save_slot_to_history(state, slot, force=True)
+        del state._slots[slot.key]
+        restored = _rehydrate_slot_from_history(state, slot.key)
+
+        assert restored is not None
+        assert restored._created_by == "member-autofix"
+        assert restored._created_by_sid == "acp-sess-creator-at-mint"
+
+    def test_an_oversize_persisted_creator_sid_restores_as_absent(self, tmp_path, monkeypatch):
+        # The same bound mint applies is applied on the way back in: a metadata
+        # line carrying an id past MAX_ACP_SESSION_ID_LEN restores the field as
+        # absent rather than retaining an oversize backend-controlled string.
+        import json as _json
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kiro_crew.dashboard.chat import restore_recent_sessions
+        from kiro_crew.dashboard.state import DashboardState
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        meta_line = {
+            "_type": "metadata",
+            "created_at": "2026-03-23T10:00:00",
+            "last_consolidated": 0,
+            "title": "Worker",
+            "agent": "kirocrew",
+            "created_by": "member-autofix",
+            "created_by_sid": "s" * (MAX_ACP_SESSION_ID_LEN + 1),
+        }
+        rows = [
+            _json.dumps(meta_line),
+            _json.dumps({"role": "user", "content": "task", "ts": "2026-03-23T10:00:00"}),
+        ]
+        path = tmp_path / "dashboard_chat-1-worker.jsonl"
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        path.touch()
+
+        sessions = MagicMock(count=0)
+        sessions.get_pid = MagicMock(return_value=None)
+        sessions.remove = AsyncMock()
+        state = DashboardState(
+            sessions=sessions,
+            crons=MagicMock(
+                list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})
+            ),
+            lessons=MagicMock(load_all=MagicMock(return_value=[])),
+            start_time=0.0,
+            conversation_log=ConversationLog(base_dir=tmp_path),
+        )
+        assert restore_recent_sessions(state, window_minutes=60) == 1
+        assert state._slots["chat-1-worker"]._created_by_sid == ""
+        assert state._slots["chat-1-worker"]._created_by == "member-autofix"
+
 
 class TestCreatedByProjection:
     """``created_by`` rides the slot payload the WS ``slots`` frames carry.

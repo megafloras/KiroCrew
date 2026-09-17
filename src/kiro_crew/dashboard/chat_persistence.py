@@ -76,7 +76,7 @@ from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.session_agent_selection import session_agent_selection_name
-from kiro_crew.validation import ARTIFACT_SLUG_RE
+from kiro_crew.validation import ARTIFACT_SLUG_RE, MAX_ACP_SESSION_ID_LEN
 
 logger = logging.getLogger(__name__)
 
@@ -1182,6 +1182,17 @@ def _rehydrate_slot_from_history(
             # worker a member dispatched would come back unowned and the
             # fail-closed `not_creator` check would strand them.
             slot._created_by = str(meta["created_by"])
+        if meta.get("created_by_sid"):
+            # The creator's ACP session id frozen at mint. Restored with the
+            # attribution so a child that restarts before its first turn still
+            # cites the creator ledger that was live when it was made, instead of
+            # writing its lineage with the sid absent. Bounded on the way back in
+            # by the same constant mint applied: a line edited past it restores
+            # as absent rather than as an oversize retained string.
+            restored_sid = str(meta["created_by_sid"])
+            slot._created_by_sid = (
+                restored_sid if len(restored_sid) <= MAX_ACP_SESSION_ID_LEN else ""
+            )
         if meta.get("folder_id"):
             slot.folder_id = meta["folder_id"]
         if meta.get("channel_folder_filed"):
@@ -1740,6 +1751,12 @@ def _apply_recent_session(
         # loses its creator binding and authorize_target refuses the
         # legitimate member with not_creator.
         slot._created_by = str(meta["created_by"])
+    if meta.get("created_by_sid"):
+        # Same as above: the creator's ACP session id frozen at mint travels with
+        # the attribution, so the child's lineage survives a restart intact --
+        # bounded on restore by the constant mint applied.
+        restored_sid = str(meta["created_by_sid"])
+        slot._created_by_sid = restored_sid if len(restored_sid) <= MAX_ACP_SESSION_ID_LEN else ""
     if meta.get("folder_id"):
         slot.folder_id = meta["folder_id"]
     if meta.get("channel_folder_filed"):
@@ -3187,6 +3204,10 @@ def _save_slot_to_history(
                     # session-control authorization reads it, so dropping it here
                     # would orphan a member's workers on the next restart.
                     fields["created_by"] = slot._created_by
+                if getattr(slot, "_created_by_sid", ""):
+                    # The creator's ACP session id frozen at mint, so a restart
+                    # before the child's first turn keeps its lineage citation.
+                    fields["created_by_sid"] = slot._created_by_sid
                 if slot.linked_session_key:
                     fields["linked_session_key"] = slot.linked_session_key
                 if getattr(slot, "channel_origin", False):
@@ -3551,6 +3572,10 @@ def _save_slot_to_history(
                 # Creator attribution — read by the member ownership boundary in
                 # session-control authorization; see the partial-save mirror above.
                 meta_line["created_by"] = slot._created_by
+            if getattr(slot, "_created_by_sid", ""):
+                # The creator's ACP session id frozen at mint -- see the
+                # partial-save mirror above.
+                meta_line["created_by_sid"] = slot._created_by_sid
             # Artifact companion binding — persisted so a bound
             # session restored after a gateway restart (or resumed from the
             # History page) comes back as the artifact's active bound session.

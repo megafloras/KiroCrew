@@ -8800,6 +8800,20 @@ async def _run_chat(
         # handle exists. This is still ahead of every turn entry, and the announce
         # decision itself is latched inside the emitter, so a retry after the header
         # landed cannot skip it.
+        #
+        # `_created_by` is `session_create`'s attribution, stamped on the slot at
+        # mint -- so it is already settled here, at the child's FIRST turn. The
+        # creator's session id is read from `_created_by_sid`, FROZEN at mint from
+        # the live caller handle, NOT re-read live here: the creator slot can be
+        # closed and replaced between mint and this first turn, and a replacement
+        # is a distinct handle with its own session id, so a live read would cite
+        # the replacement's ledger and corrupt this child's immutable
+        # `session/opened` lineage with no recovery. The creator's ledger is keyed
+        # by that frozen id, so `parent_sid` is what lets a fold open the unit that
+        # was live when this child was made; a creator whose handle had no session
+        # at mint gets its slot recorded, sid absent.
+        _creator_key = str(getattr(slot, "_created_by", "") or "")
+        _creator_sid = str(getattr(slot, "_created_by_sid", "") or "")
         session_ledger_emit.on_session_opened(
             _ledger_sid,
             agent=slot.agent or "",
@@ -8807,6 +8821,8 @@ async def _run_chat(
             model=_ledger_model(slot),
             cwd=slot.project or "",
             resumed=bool(resumed),
+            parent_slot=_creator_key,
+            parent_sid=_creator_sid,
         )
         agent_label = kiro_agent or slot.agent or "default"
         # The label states what the session RUNS on, so a withheld pin reports the
