@@ -58,6 +58,7 @@ __all__ = [
     "REMOVAL_UNVERIFIABLE",
     "SKIP_NOT_REGULAR",
     "SKIP_SYMLINK",
+    "SKIP_UNREADABLE_ENTRY",
     "SKIP_VANISHED",
     "SkipReporter",
     "StagedRemoval",
@@ -105,6 +106,13 @@ SKIP_VANISHED = "vanished"
 SKIP_NOT_REGULAR = "not_regular"
 SKIP_TOO_LARGE = "too_large"
 SKIP_IDENTITY_CHANGED = "identity_changed"
+#: The entry is still there and this process may not read its metadata or its bytes
+#: -- a platform-protected path, or one an ACL denies. Distinct from SKIP_VANISHED,
+#: which says the name is gone: a caller that must not omit anything silently has to
+#: tell those apart. Spelled for the ENTRY rather than reusing the neighbouring
+#: module's SKIP_UNREADABLE, whose value is a different string for a different
+#: subject (an unreadable trash BATCH).
+SKIP_UNREADABLE_ENTRY = "unreadable_entry"
 
 #: ``(reason_code, by_name_path)``. The path is for the message only -- it is never
 #: re-opened, because re-opening it is the bug this module exists to prevent.
@@ -447,6 +455,7 @@ def copy_file_pinned(
     dst_dir_fd: int | None = None,
     dst_name: str | None = None,
     skip_existing: bool = False,
+    skip_unreadable: bool = False,
     force_mode: int | None = None,
     max_bytes: int | None = None,
     expected_src_ident: "tuple[int, int] | None" = None,
@@ -456,6 +465,15 @@ def copy_file_pinned(
     """Copy one file's bytes from a descriptor pinned to a validated inode.
 
     Returns True when bytes were copied, False when the source was skipped.
+
+    ``skip_unreadable`` tolerates ONE failure: the SOURCE open being refused for
+    permission, which is reported as ``SKIP_UNREADABLE_ENTRY`` and returns False.
+    It is deliberately not a tolerance for the copy as a whole. A caller that
+    wrapped this call instead could not tell the two ends apart, so a DESTINATION
+    refusal was recorded as an unreadable source -- an omission attributed to the
+    operator's data rather than to the failure to write it, in a bundle that then
+    reported success and let retention prune a complete one. Only the end that was
+    actually refused is knowable here, so the decision belongs here.
 
     ``expected_src_ident`` (when given) is the ``(st_dev, st_ino)`` a caller's
     own validation observed: the copy proceeds only when the pinned source
@@ -548,6 +566,11 @@ def copy_file_pinned(
                 # A symlink final component that appeared after the listing-time link
                 # screen -- refuse it the same way the screen would have.
                 on_skip(SKIP_SYMLINK, by_name)
+                return False
+            if skip_unreadable and isinstance(exc, PermissionError):
+                # The SOURCE, and only here: this is the one open in this function
+                # that reads the operator's file. Everything below writes.
+                on_skip(SKIP_UNREADABLE_ENTRY, by_name)
                 return False
             raise
     try:
@@ -1053,6 +1076,7 @@ def stage_tree_pinned(
     on_skip: SkipReporter = _noop_skip,
     skip_existing: bool = False,
     must_create: bool = False,
+    skip_unreadable: bool = False,
     refusal: type[Exception] = PinnedPathRefusal,
 ) -> None:
     """Copy a tree with BOTH traversals pinned end to end.
@@ -1083,6 +1107,17 @@ def stage_tree_pinned(
     other error propagates, so a staging pass never silently ships without files it
     failed to read.
 
+    *skip_unreadable* is the one exception, and it is off by default. With it, an
+    entry whose metadata or bytes this process may not read is reported as
+    ``SKIP_UNREADABLE_ENTRY`` and skipped -- a file, a directory whose open is
+    refused, and the tree's own root alike, since a tolerance that covered only
+    files still ended the operation on a directory. It belongs ONLY to a caller that records
+    every skip somewhere the operator will read it: a data home can hold a
+    platform-protected path that no retry will make readable, and ending the walk
+    there leaves them with no backup at all instead of one that declares the gap. A
+    RESTORE must never set it -- there the unreadable name is the archive's own
+    content, so skipping it drops data the operator asked to have put back.
+
     Refuses outright on a platform that cannot pin a tree. Callers that must still
     function there are expected to say so explicitly rather than have this module
     quietly hand them a by-name walk -- see :func:`supports_pinned_tree_walk`.
@@ -1108,10 +1143,25 @@ def stage_tree_pinned(
             except FileNotFoundError:
                 on_skip(SKIP_VANISHED, path)
                 continue
+            except PermissionError:
+                # Unclassifiable, so there is nothing to copy and nothing to descend
+                # into. Reported under its own reason rather than as a vanished entry:
+                # the name is still there, and a caller recording the omission has to
+                # be able to say which of the two it was.
+                #
+                # The PERMISSION class only. An EIO or an ENOTCONN says the storage
+                # is failing, and a backup that quietly omits files because the disk
+                # is dying is the worst possible artefact -- those still end the walk.
+                if not skip_unreadable:
+                    raise
+                on_skip(SKIP_UNREADABLE_ENTRY, path)
+                continue
             if _stat.S_ISLNK(st.st_mode):
                 on_skip(SKIP_SYMLINK, path)
             elif _stat.S_ISDIR(st.st_mode):
-                child_src = _open_child_dir(src_fd, entry, path, on_skip)
+                child_src = _open_child_dir(
+                    src_fd, entry, path, on_skip, skip_unreadable=skip_unreadable
+                )
                 if child_src is None:
                     continue
                 try:
@@ -1202,6 +1252,7 @@ def stage_tree_pinned(
                         dst_dir_fd=dst_fd,
                         dst_name=entry,
                         skip_existing=skip_existing,
+                        skip_unreadable=skip_unreadable,
                         on_skip=on_skip,
                     )
                 except FileNotFoundError:
@@ -1238,6 +1289,14 @@ def stage_tree_pinned(
             errno.ENOTDIR,
             errno.ENOENT,
         ):
+            # A ROOT refused for permission is the same omission as a refused entry
+            # inside it, and it reaches the recorder the same way, so a caller that
+            # declares the gap declares this one too. Every other errno still ends
+            # the walk. Without this the tolerance was file-shaped only: a tree whose
+            # own directory cannot be opened still ended the operation.
+            if skip_unreadable and isinstance(exc, PermissionError):
+                on_skip(SKIP_UNREADABLE_ENTRY, str(src))
+                return
             raise
         on_skip(SKIP_SYMLINK, str(src))
         return
@@ -1276,7 +1335,14 @@ def stage_tree_pinned(
         os.close(root_src)
 
 
-def _open_child_dir(parent_fd: int, entry: str, by_name: str, on_skip: SkipReporter) -> int | None:
+def _open_child_dir(
+    parent_fd: int,
+    entry: str,
+    by_name: str,
+    on_skip: SkipReporter,
+    *,
+    skip_unreadable: bool = False,
+) -> int | None:
     """Open a child directory through *parent_fd*, or report why it was skipped.
 
     Returns ``None`` for the two races worth tolerating -- the entry vanished, or it
@@ -1288,6 +1354,11 @@ def _open_child_dir(parent_fd: int, entry: str, by_name: str, on_skip: SkipRepor
     Extracted because the source and destination sides need identical handling, and
     the version of this code that had it on one side only let the swap the source
     skipped escape the destination as a raw ``OSError``.
+
+    *skip_unreadable* adds one more tolerated case, for a SOURCE side that records
+    what it omitted: a directory whose open is REFUSED for permission is reported as
+    ``SKIP_UNREADABLE_ENTRY`` rather than ending the walk. It stays off for the
+    destination, where the same failure means the copy has nowhere to go.
     """
     try:
         return os.open(entry, dir_flags(), dir_fd=parent_fd)
@@ -1297,6 +1368,9 @@ def _open_child_dir(parent_fd: int, entry: str, by_name: str, on_skip: SkipRepor
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
             on_skip(SKIP_SYMLINK, by_name)
+            return None
+        if skip_unreadable and isinstance(exc, PermissionError):
+            on_skip(SKIP_UNREADABLE_ENTRY, by_name)
             return None
         raise
 

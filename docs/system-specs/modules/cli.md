@@ -252,9 +252,22 @@ earlier attempts at this change. The flag is a permission for a platform that ca
 pin, **not** a switch that turns pinning off where it works.
 
 `MANIFEST.json` also carries `"skipped"`: any file omitted during staging (a hardlink
-alias, a symlink, an entry that vanished mid-walk) with its reason, so an incomplete
-archive says so in its own record instead of only in the console output of whoever ran
-the command.
+alias, a symlink, an entry that vanished mid-walk, or an entry present but refused for
+permission -- `unreadable_entry`) with its reason, so an incomplete archive says so in
+its own record instead of only in the console output of whoever ran the command.
+
+`unreadable_entry` is the one reason that is a TOLERANCE rather than a screen, and it is
+narrow in three ways. It belongs to snapshot creation only -- restore and merge still
+stop, because there the unreadable name is the archive's own content and skipping it
+would drop data the operator asked to have put back. It covers only the permission
+class, so a failing device still ends the command instead of producing a backup that
+quietly omits whatever the disk refused. And it covers only reads of the operator's
+own file: a refusal to WRITE the staged copy is never recorded as the source being
+unreadable. A data home can hold a platform-protected path that no retry will make
+readable, and refusing to produce any backup over one file is worse than a bundle whose
+manifest names the gap. Files a component DECLARES are not covered: those are
+product-owned state, and a bundle that silently shipped without `config.json` would be
+worse than a refusal, so that loop still fails hard.
 
 SQLite databases are **out of scope** for the pinned staging described here: they keep the
 `sqlite3.backup()` path they already had, which reopens the live name. Capturing a live
