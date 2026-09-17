@@ -656,25 +656,108 @@ BUILTIN_REMOTE_PROVISIONER = RemoteProvisioner(
     posix_only=True,
 )
 
+#: The id a launch request names as ``provider_id`` for the Fargate lane.
+FARGATE_PROVISIONER_ID = "aws_fargate"
+
+#: The Fargate descriptor. ``kind`` equals the id, so the dashboard looks for a
+#: renderer registered under that kind and skips the row when none is, rather than
+#: handing the EC2 form a lane that takes no instance type.
+FARGATE_REMOTE_PROVISIONER = RemoteProvisioner(
+    id=FARGATE_PROVISIONER_ID,
+    kind=FARGATE_PROVISIONER_ID,
+    label="AWS Fargate in your own account",
+    posix_only=True,
+)
+
 
 class DefaultRemoteProvisionerProvider:
-    """The one provisioner the core ships: EC2 in the user's own AWS account.
+    """The provisioners the core ships: EC2 always, Fargate when it is configured.
 
-    ``provisioners()`` returns the single ``aws_ec2`` descriptor and
-    ``engine_for`` hands out ``RealLaunchEngine`` for it, so the stock Set-up
-    tab and its launch path are unchanged. A companion replaces this via
-    ``dataclasses.replace(ctx, remote_provisioners=...)`` to add a lane (or
-    withdraw the AWS one on a fleet whose users have no AWS account of their
-    own). The engine import is deferred: ``cloud/launch_engine.py`` pulls in the
-    whole ``cloud/`` package and this module is loaded during ``platform`` init.
+    ``provisioners()`` always returns the ``aws_ec2`` descriptor and ``engine_for``
+    hands out ``RealLaunchEngine`` for it, so the stock Set-up tab and its launch
+    path are unchanged. A companion still replaces this whole object via
+    ``dataclasses.replace(ctx, remote_provisioners=...)`` to add a lane of its own
+    (or withdraw the AWS one on a fleet whose users have no AWS account).
+
+    **The Fargate lane is offered only when ``cloud.json`` configures it, and that
+    is deliberate.** ``FargateLaunchEngine`` refuses to guess a placement, an image
+    or a secret ARN -- an unnamed subnet is the same class of error as deleting a
+    task on a guess -- so a lane offered without those fields is a lane that
+    rejects every launch made through it, spending an operator's attention at
+    launch time on a mistake that was visible when they saved the file.
+    ``FargateConfig`` is the judge: complete means the lane exists, anything else
+    means it does not.
+
+    Registering it does NOT put a row in the Set-up selector on its own.
+    ``RemoteProvisioner.kind`` names a frontend form and the dashboard skips a kind
+    it cannot draw; no ``registerRemoteProvisionerRenderer`` claims this kind today,
+    so the lane is reachable through the API and absent from the selector until one
+    does -- absent rather than broken, which is what that skip exists for.
+
+    Every cloud import here is DEFERRED, and not only for weight.
+    ``kiro_crew.cloud`` reaches ``kiro_crew.sandbox``, which imports
+    ``kiro_crew.platform.current_context``, so a module-level import raises
+    ``ImportError: cannot import name 'current_context' from partially initialized
+    module`` -- this module is loaded during ``platform`` init. Measured after
+    bootstrap, ``kiro_crew.cloud.config`` alone is 105 ms and 122 modules against a
+    126 ms init, so deferring is also what keeps a lane most deployments have not
+    configured from doubling startup.
     """
 
     def provisioners(self) -> List[RemoteProvisioner]:
-        return [BUILTIN_REMOTE_PROVISIONER]
+        rows = [BUILTIN_REMOTE_PROVISIONER]
+        if self._fargate_config() is not None:
+            rows.append(FARGATE_REMOTE_PROVISIONER)
+        return rows
 
     def engine_for(self, provisioner_id: str) -> Any:
-        if provisioner_id != BUILTIN_PROVISIONER_ID:
-            raise KeyError(provisioner_id)
-        from kiro_crew.cloud.launch_engine import RealLaunchEngine  # deferred: heavy
+        if provisioner_id == BUILTIN_PROVISIONER_ID:
+            from kiro_crew.cloud.launch_engine import RealLaunchEngine  # deferred: heavy
 
-        return RealLaunchEngine()
+            return RealLaunchEngine()
+        if provisioner_id != FARGATE_PROVISIONER_ID:
+            raise KeyError(provisioner_id)
+        config = self._fargate_config()
+        if config is None:
+            # The same KeyError an unknown id raises. A caller naming an
+            # unconfigured lane and one naming a nonexistent lane are in the same
+            # position -- there is no engine -- and a second failure mode would ask
+            # every caller to learn a distinction that changes nothing they can do.
+            raise KeyError(provisioner_id)
+        from kiro_crew.cloud.fargate.identity import SecretRef  # deferred: see the class note
+        from kiro_crew.cloud.fargate.runtask import Placement
+        from kiro_crew.cloud.fargate_engine import FargateLaunchEngine, FargateLaunchSpec
+
+        return FargateLaunchEngine(
+            FargateLaunchSpec(
+                placement=Placement(
+                    cluster=config.cluster,
+                    subnets=tuple(config.subnets),
+                    security_groups=tuple(config.security_groups),
+                    assign_public_ip=config.assign_public_ip,
+                ),
+                image=config.image,
+                secrets=tuple(SecretRef(name=name, arn=arn) for name, arn in config.secrets),
+                cpu_architecture=config.cpu_architecture,
+            )
+        )
+
+    @staticmethod
+    def _fargate_config() -> Any:
+        """The configured Fargate block, or ``None``. A read failure is ``None``.
+
+        Read PER CALL, so an operator who edits ``cloud.json`` gets the new answer
+        from the next request rather than the next gateway restart, and a lane
+        removed from the file leaves the selector for the same reason.
+
+        A failure returns ``None`` rather than raising because this runs while the
+        selector is being built: raising would take the whole provisioner list down
+        over one malformed block and hide the ``aws_ec2`` lane too, turning one
+        lane's misconfiguration into a Set-up tab that shows nothing.
+        """
+        try:
+            from kiro_crew.cloud.config import CloudConfig  # deferred: see the class note
+
+            return CloudConfig.load().fargate_config()
+        except Exception:  # noqa: BLE001 - a config read must not break the selector
+            return None
