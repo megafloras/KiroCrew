@@ -214,6 +214,7 @@ from kiro_crew.config.sections import (  # noqa: F401
     ComputerUseConfig,
     CronHistoryConfig,
     DashboardConfig,
+    DecisionsConfig,
     DiscordConfig,
     ExternalRegistryConfig,
     FeishuConfig,
@@ -3675,6 +3676,15 @@ class KiroCrewConfig:
         default_factory=HeartbeatConfig,
         metadata=_meta("Heartbeat", "Heartbeat background task queue delivery defaults."),
     )
+    decisions: DecisionsConfig = field(
+        default_factory=DecisionsConfig,
+        metadata=_meta(
+            "Decisions",
+            "DecisionOracle seam — typed decisions asked of a System One model "
+            "at named points. Off by default (decisions.preview=false), in which "
+            "case every point returns None with no network call and no log write.",
+        ),
+    )
     watchdog: WatchdogConfig = field(
         default_factory=WatchdogConfig,
         metadata=_meta("Watchdog", "ACP per-session watchdog / liveness-oracle windows."),
@@ -4321,6 +4331,7 @@ class KiroCrewConfig:
         telemetry_data = _coerced_section(data, "telemetry", _degraded)
         orchestrator_data = _coerced_section(data, "orchestrator", _degraded)
         watchdog_data = _coerced_section(data, "watchdog", _degraded)
+        decisions_data = _coerced_section(data, "decisions", _degraded)
         resource_limits_data = _coerced_section(data, "resource_limits", _degraded)
 
         # Parse agents section into dict[str, KiroCrewAgentConfig]
@@ -4551,6 +4562,7 @@ class KiroCrewConfig:
                 connect_timeout_raw, instances_data, mint_timeout_raw
             ),
             heartbeat=HeartbeatConfig(default_deliver=heartbeat_default_deliver),
+            decisions=DecisionsConfig.from_raw(decisions_data),
             skills=_build_skills_config(skills_data),
             session_summary=_build_session_summary_config(session_summary_data),
             slack_channels={
@@ -4801,6 +4813,7 @@ class KiroCrewConfig:
             "cron_history": asdict(self.cron_history),
             "knowledge": asdict(self.knowledge),
             "heartbeat": asdict(self.heartbeat),
+            "decisions": asdict(self.decisions),
             "skills": asdict(self.skills),
             "session_summary": asdict(self.session_summary),
             "telemetry": asdict(self.telemetry),

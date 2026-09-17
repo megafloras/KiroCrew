@@ -5655,6 +5655,256 @@ class InstancesConfig:
             object.__setattr__(self, "probe_failure_threshold", _DEFAULT_PROBE_FAILS)
 
 
+# Arm values for a decision point (``decisions.points.<name>.arm``). Single
+# source of truth shared by the field metadata enum, the loader's normalizer and
+# the gate's own constants -- a fourth arm added in one place cannot silently
+# normalize back to the default in another.
+#
+# ``off``    -- the point does not call the seam at all.
+# ``shadow`` -- the seam is called and the row is logged, but ``decide`` returns
+#               None so behaviour is byte-identical to the arm being off.
+# ``live``   -- the answer is returned and the caller may act on it.
+DECISION_ARM_OFF = "off"
+DECISION_ARM_SHADOW = "shadow"
+DECISION_ARM_LIVE = "live"
+DECISION_ARMS = (DECISION_ARM_OFF, DECISION_ARM_SHADOW, DECISION_ARM_LIVE)
+
+# Implementations a point can be answered by (``decisions.points.<name>.impl``).
+# ``jev`` is the System One provider; ``llm`` answers the same questions with a
+# background chat turn so the two can be compared before a provider key exists.
+DECISION_IMPL_JEV = "jev"
+DECISION_IMPL_LLM = "llm"
+DECISION_IMPLS = (DECISION_IMPL_JEV, DECISION_IMPL_LLM)
+DECISION_PROVIDER_ENDPOINT_DEFAULT = "https://api.typesafe.ai/v1/systemone"
+
+# Sampling bucket bounds, as a percentage of sessions. 0 admits nothing, 100
+# admits everything; the gate clamps to this range rather than treating an
+# out-of-range value as a third way to disable a point.
+DECISION_BUCKET_MIN = 0
+DECISION_BUCKET_MAX = 100
+
+# Point names this build ships. Used only to give the loader something to WARN
+# against -- an unrecognised name is still parsed and preserved, because a
+# config written for a newer build must not be mangled by an older one.
+DECISION_POINT_NAMES = (
+    "skills.select",
+    "skills.dedupe",
+    "cron.novelty",
+)
+
+
+@dataclass
+class DecisionProviderConfig:
+    """Where the System One provider lives and what it is allowed to cost.
+
+    One provider for every point: A/B experiments move ``impl`` and ``bucket`` on
+    a point, never the endpoint, so a per-point provider would only be a second
+    place for a stale endpoint to hide.
+    """
+
+    endpoint: str = field(
+        default=DECISION_PROVIDER_ENDPOINT_DEFAULT,
+        metadata=_meta(
+            "Endpoint",
+            "Full URL of the evaluation endpoint. Override only to point at a "
+            "compatible proxy — the request and response field names are fixed by "
+            "the TypeSafe API, not by this setting.",
+        ),
+    )
+    api_key: str = field(
+        default="secret://TYPESAFE_API_KEY",
+        metadata=_meta(
+            "API Key",
+            "The provider credential. Prefer the 'secret://NAME' form, which "
+            "reads NAME from the dashboard secrets vault so no key is stored in "
+            "config.json. A literal value is still accepted for an operator "
+            "mid-migration. With no usable key the seam logs a row saying so and "
+            "returns None — it never sends an empty bearer token.",
+            sensitive=True,
+        ),
+    )
+    model: str = field(
+        default="jev-latest",
+        metadata=_meta(
+            "Model",
+            "Provider model id. 'jev-latest' is TypeSafe's flagship System One " "model.",
+        ),
+    )
+    timeout_ms: int = field(
+        default=1000,
+        metadata=_meta(
+            "Timeout (ms)",
+            "Total budget for one decision, in milliseconds. Exceeding it logs "
+            "error='timeout' and returns None, so this is the ceiling a point "
+            "adds to the path it sits in — not a target. Values at or below zero "
+            "are floored to 1ms rather than disabling the timeout.",
+        ),
+    )
+
+
+@dataclass
+class DecisionPointConfig:
+    """One decision point's arm, implementation and sampling rate."""
+
+    arm: str = field(
+        default=DECISION_ARM_OFF,
+        metadata=_meta(
+            "Arm",
+            "'off' (the point never calls the seam), 'shadow' (the seam is "
+            "called and logged, but the answer is discarded so behaviour is "
+            "unchanged), or 'live' (the caller may act on the answer). Anything "
+            "unrecognised is read as 'off'.",
+            enum=list(DECISION_ARMS),
+        ),
+    )
+    impl: str = field(
+        default=DECISION_IMPL_LLM,
+        metadata=_meta(
+            "Implementation",
+            "Which implementation answers this point: 'llm' (the default, using "
+            "a background chat turn) or 'jev' (the System One provider, available "
+            "as an explicit opt-in). Anything unrecognised is read as 'llm'.",
+            enum=list(DECISION_IMPLS),
+        ),
+    )
+    bucket: int = field(
+        default=DECISION_BUCKET_MAX,
+        metadata=_meta(
+            "Bucket (%)",
+            "Percentage of sessions this point fires for, 0-100, decided by a "
+            "hash of the session key so a session is consistently in or out. 0 "
+            "fires for nobody, 100 for everybody. Out-of-range values are "
+            "clamped — use 'arm' to disable a point, not a zero bucket.",
+        ),
+    )
+
+
+@dataclass
+class DecisionsConfig:
+    """DecisionOracle seam (``src/kiro_crew/decisions/``). Off by default.
+
+    ``preview`` is the main switch and lives HERE, in config.json, rather than
+    with the frontend's other feature previews: those are per-device
+    localStorage flags (``website/src/utils/previewFlags.ts``) that the backend
+    cannot read, and this gate is enforced in the backend. The Settings card
+    writes this value.
+
+    Every field is hot-applied (no ``restart=True`` anywhere): the gate reads the
+    live snapshot per call, so flipping an arm takes effect on the next decision
+    without a gateway restart. That is what makes ``preview`` usable as a kill
+    switch.
+    """
+
+    preview: bool = field(
+        default=False,
+        metadata=_meta(
+            "Preview",
+            "Main switch for the DecisionOracle seam. False (the default) "
+            "means every decision point returns None with no network call, no "
+            "log write and no measurable cost. True lets each point's own 'arm' "
+            "decide. Turning this on can send the state a point collects to the "
+            "configured provider, so read each point's help before enabling.",
+        ),
+    )
+    provider: DecisionProviderConfig = field(
+        default_factory=DecisionProviderConfig,
+        metadata=_meta("Provider", "Where decisions are sent and what they may cost."),
+    )
+    points: dict[str, DecisionPointConfig] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Points",
+            "Per-point settings keyed by point name (e.g. 'skills.select'). A "
+            "point absent from this map is off. A name this build does not "
+            "recognise is warned about at load and preserved on save, so a "
+            "config written for a newer build survives an older one.",
+        ),
+    )
+
+    @classmethod
+    def from_raw(cls, section: object) -> "DecisionsConfig":
+        """Build from a raw ``decisions`` dict -- the ONE parse site.
+
+        Lives here rather than in the loader for two reasons. The arm/impl
+        vocabularies and the bucket bounds are declared a few lines above, and a
+        normalizer that reads them from another module would need those private
+        names re-exported across a frozen module boundary
+        (``test_config_module_boundaries``). And every value is NORMALIZED rather
+        than validated-and-rejected -- this section gates a seam that is off by
+        default, so the fail-closed reading of any unreadable value is the
+        default, and a hand-edited config.json must not stop the gateway booting.
+
+        Accepts whatever ``json.loads`` produced, including ``None`` and a
+        non-dict, for the same reason ``ResourceLimitsConfig.from_raw`` does.
+        """
+        if not isinstance(section, dict):
+            return cls()
+
+        raw_provider = section.get("provider")
+        raw_provider = raw_provider if isinstance(raw_provider, dict) else {}
+        provider = DecisionProviderConfig(
+            endpoint=str(raw_provider.get("endpoint", DecisionProviderConfig.endpoint) or ""),
+            api_key=str(raw_provider.get("api_key", DecisionProviderConfig.api_key) or ""),
+            model=str(raw_provider.get("model", DecisionProviderConfig.model) or ""),
+            timeout_ms=_safe_int(
+                raw_provider.get("timeout_ms", DecisionProviderConfig.timeout_ms),
+                DecisionProviderConfig.timeout_ms,
+            ),
+        )
+
+        raw_points = section.get("points")
+        raw_points = raw_points if isinstance(raw_points, dict) else {}
+        points: dict[str, DecisionPointConfig] = {}
+        for name, entry in raw_points.items():
+            if not isinstance(name, str) or not isinstance(entry, dict):
+                continue
+            if name not in DECISION_POINT_NAMES:
+                # Warned about but KEPT. Dropping it would be worse in both
+                # directions: a config written for a newer build would lose the
+                # operator's arm on the next save (to_dict emits what this
+                # parsed), and a merely misspelled name is easier to find in a
+                # warning than in a silently missing effect.
+                logger.warning(
+                    "config: decisions.points has unknown point %r (known: %s) "
+                    "- parsed and preserved, but nothing reads it",
+                    name,
+                    ", ".join(DECISION_POINT_NAMES),
+                )
+            arm = str(entry.get("arm", DECISION_ARM_OFF) or "").strip().lower()
+            if arm not in DECISION_ARMS:
+                arm = DECISION_ARM_OFF
+            if arm == DECISION_ARM_LIVE:
+                logger.warning(
+                    "config: decisions.points.%s uses arm='live', but no decision "
+                    "point consumes live answers in this release",
+                    name,
+                )
+            impl = str(entry.get("impl", DECISION_IMPL_LLM) or "").strip().lower()
+            if impl not in DECISION_IMPLS:
+                impl = DECISION_IMPL_LLM
+            bucket = _safe_int(entry.get("bucket", DECISION_BUCKET_MAX), DECISION_BUCKET_MAX)
+            points[name] = DecisionPointConfig(
+                arm=arm,
+                impl=impl,
+                # Clamped here as well as in the gate. The gate clamps because it
+                # must never trust a value it did not parse; clamping here is
+                # what makes the SAVED config say what is in force, so an
+                # operator who wrote 500 sees 100 come back rather than a number
+                # that behaves as 100 while reading as 500.
+                bucket=max(DECISION_BUCKET_MIN, min(DECISION_BUCKET_MAX, bucket)),
+            )
+
+        return cls(
+            # _safe_bool, not bool(): a string "false" from a hand-edited config
+            # is truthy to bool() and would silently ARM the seam. This is the
+            # main switch for sending conversation state off the machine, so an
+            # unreadable value must resolve to off.
+            preview=_safe_bool(section.get("preview", False), False),
+            provider=provider,
+            points=points,
+        )
+
+
 @dataclass
 class HeartbeatConfig:
     """Heartbeat background task queue (~/.kiro/crew/workspace/HEARTBEAT.md)."""

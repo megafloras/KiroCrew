@@ -5354,6 +5354,11 @@ class GatewayOrchestrator:
 
                 if _model_downgraded:
                     result_text = _annotate_model_downgrade(result_text)
+                # Previous result text, read BEFORE set_run_result overwrites it.
+                # The novelty shadow below compares the two texts, and past this
+                # line the only surviving trace of the old one is its hash.
+                _prev_cron_result = job.last_result or ""
+
                 result_text = _annotate_model_fallback(result_text, client)
 
                 job.set_run_result(result_text)
@@ -5648,6 +5653,37 @@ class GatewayOrchestrator:
                                 f"⚠️ Job completed but Slack delivery failed: {exc_msg}",
                                 meta={"job_id": job.id},
                             )
+                # DecisionOracle shadow (cron.novelty) — reaching here with
+                # the delivery anchor advanced means a channel or Slack send was
+                # confirmed. Silent and failed deliveries return with the old
+                # anchor, so they cannot be logged as delivered baselines.
+                if rh == job.last_posted_hash:
+                    try:
+                        from kiro_crew.decisions.points.cron_novelty import (
+                            shadow_cron_novelty,
+                        )
+
+                        # Inside the guard, never in the `if` above it. This
+                        # hashes the PREVIOUS result to exclude the identical
+                        # 24-hour reminder, whose delivery also advances the
+                        # anchor; `_result_hash` calls `.encode()`, so a previous
+                        # result that is not a string raises -- and a raise in the
+                        # condition would escape this try and fail the cron job
+                        # the hook only means to observe.
+                        _previous = _prev_cron_result if isinstance(_prev_cron_result, str) else ""
+                        if rh != _result_hash(_previous):
+                            asyncio.get_running_loop().create_task(
+                                shadow_cron_novelty(
+                                    job.id,
+                                    job.name,
+                                    _previous,
+                                    result_text,
+                                    session_key=f"cron:{job.id}",
+                                )
+                            )
+                    except Exception:
+                        logger.debug("cron.novelty shadow hook skipped", exc_info=True)
+
                 # Session cleanup happens in finally block
                 return result_text
             except Exception as exc:

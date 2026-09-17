@@ -3879,6 +3879,22 @@ class DashboardState:
         owner_id: str = "",
     ):
         self.sessions = sessions
+        # The DecisionOracle seam's LLM comparison lane needs a
+        # SessionManager-like object for ``run_bg_oneliner``, but its callers are
+        # hot paths (skills matching, dedupe, cron novelty) that have no reason to
+        # hold one -- one of them runs inside a synchronous ``build_message``.
+        # Registering it here rather than threading it through ``decide`` keeps
+        # the dashboard out of every point file's signature, and this ``__init__``
+        # is the single funnel both DashboardState construction sites pass
+        # through. The lane holds it weakly, so this does not extend the
+        # manager's lifetime. Best-effort: the seam is off by default, so a
+        # failure here must never stop a dashboard from starting.
+        try:
+            from kiro_crew.decisions.impl_llm import set_bg_sessions
+
+            set_bg_sessions(sessions)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("decisions: could not register background sessions", exc_info=True)
         self.crons = crons
         self.lessons = lessons
         self.start_time = start_time

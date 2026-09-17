@@ -3054,6 +3054,18 @@ class ContextBuilder:
         self.lessons = lessons or LessonStore()
         self.conversation_log = conversation_log
         self.channel_history = channel_history
+        # Captured for the DecisionOracle shadow at `skills.select`. Production
+        # reaches `build_message` only through `run_in_embed_pool`, a thread
+        # executor with no running loop, so the hook cannot obtain one where it
+        # fires; every ContextBuilder construction site runs inside `async def`,
+        # so this is where a loop exists to capture. Same shape and same reason
+        # as `HistoryConsolidator._event_loop`. `None` outside a loop -- a sync
+        # test, a script -- simply means no shadow, which is the seam's normal
+        # refusal rather than an error.
+        try:
+            self._decisions_loop: "asyncio.AbstractEventLoop | None" = asyncio.get_running_loop()
+        except RuntimeError:
+            self._decisions_loop = None
         self.memory_mode_for_session: Callable[[str], Awaitable[str]] | None = None
         self._session_memory_modes: dict[str, str] = {}
         if bot_name:
@@ -4786,6 +4798,42 @@ class ContextBuilder:
         # in the window.
         if not is_custom and not minimal_context:
             triggered = self.skills.get_triggered_skills(text, project_dir=project)
+
+            # DecisionOracle shadow (skills.select) — record what an oracle
+            # would have selected for this message, beside what trigger
+            # matching did. Fire-and-forget: `triggered` is not read back and
+            # nothing below sees this, so the injected skill list is identical
+            # to a tree without the seam. Two reasons it cannot be awaited here:
+            # build_message is synchronous, and a selection budget on the turn's
+            # critical path is a separate change. Candidate enumeration is
+            # passed as a callable so it runs on the task, not on this line.
+            # Silent by construction — no running loop, no core package, or any
+            # failure inside the hook leaves message assembly untouched.
+            try:
+                from kiro_crew.decisions.points.skills_select import (
+                    candidates_from_loader,
+                    shadow_skills_select,
+                )
+
+                # Submitted to the loop captured at construction, not one
+                # fetched here: this runs on an executor thread, so
+                # `get_running_loop()` raised and the observation was silently
+                # dropped. The future is deliberately never read -- fire and
+                # forget, exactly like the dedupe hook.
+                _decisions_loop = self._decisions_loop
+                if _decisions_loop is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        shadow_skills_select(
+                            text,
+                            lambda: candidates_from_loader(self.skills, project),
+                            list(triggered),
+                            session_key=session_key,
+                        ),
+                        _decisions_loop,
+                    )
+            except Exception:
+                logger.debug("skills.select shadow hook skipped", exc_info=True)
+
             if triggered:
                 enforced, pointer_only = self.skills.split_triggered(triggered, project)
                 # Log the split, not just the match: a pointed-at skill the

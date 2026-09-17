@@ -60,6 +60,8 @@ _BANNED_AFTER_CLI_IMPORT = (
     "kiro_crew.slack.gateway",
     "kiro_crew.dashboard.state",
     "kiro_crew.vector_memory",
+    "kiro_crew.cli_decisions",
+    "kiro_crew.decisions",
     "numpy",
 )
 
@@ -79,7 +81,11 @@ def test_cli_import_does_not_load_heavy_modules() -> None:
         "print(repr(present))"
     )
     res = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
     )
     assert res.returncode == 0, f"import kiro_crew.cli failed:\n{res.stderr}"
     present = ast.literal_eval(res.stdout.strip())
@@ -94,14 +100,14 @@ def _local_imports_in_main() -> list[tuple[str, str]]:
     """(module, name) for every function-local kiro_crew import inside main()."""
     tree = ast.parse(_CLI_PY.read_text(encoding="utf-8"))
     main_fn = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "main"
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main"
     )
     found: list[tuple[str, str]] = []
     for node in ast.walk(main_fn):
-        if isinstance(node, ast.ImportFrom) and node.module and (
-            node.module == "kiro_crew" or node.module.startswith("kiro_crew.")
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and (node.module == "kiro_crew" or node.module.startswith("kiro_crew."))
         ):
             for alias in node.names:
                 found.append((node.module, alias.name))
@@ -134,9 +140,7 @@ def test_every_deferred_dispatch_import_resolves(module: str, name: str) -> None
     assert hasattr(mod, name), f"main() imports {name} from {module}, which lacks it"
 
 
-def _read_line(
-    proc: subprocess.Popen, subcommand: str, what: str, budget: float = 30.0
-) -> str:
+def _read_line(proc: subprocess.Popen, subcommand: str, what: str, budget: float = 30.0) -> str:
     """One handshake line within ``budget``, or a named failure — never a blocked worker.
 
     A bare ``proc.stdout.readline()`` on a server that boots but neither answers
@@ -191,7 +195,9 @@ def _stdio_roundtrip(subcommand: str, tmp_path: Path) -> list[str]:
         assert line, f"{subcommand}: no initialize response (stderr: {proc.stderr.read()[:500]})"
         resp = json.loads(line)
         assert resp.get("id") == 1 and "result" in resp, f"bad initialize response: {resp}"
-        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        proc.stdin.write(
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+        )
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n")
         proc.stdin.flush()
         line2 = _read_line(proc, subcommand, "tools/list")
@@ -232,9 +238,7 @@ def test_boot_platform_runs_before_mcp_core_dispatch(monkeypatch) -> None:
     """
     order: list[str] = []
 
-    monkeypatch.setattr(
-        cli, "boot_platform", lambda *_a, **_k: order.append("boot_platform")
-    )
+    monkeypatch.setattr(cli, "boot_platform", lambda *_a, **_k: order.append("boot_platform"))
 
     fake_mcp_core = types.ModuleType("kiro_crew.mcp_core")
     fake_mcp_core.run_mcp_core_server = lambda: order.append("dispatch")  # type: ignore[attr-defined]

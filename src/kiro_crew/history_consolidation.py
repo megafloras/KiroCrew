@@ -1794,7 +1794,29 @@ class HistoryConsolidator:
             # to new). Either way, confirm with the cheap lexical check before
             # concluding the candidate is unique.
             if verdict == VERDICT_NEW:
-                return _lexical()
+                verdict, key = _lexical()
+
+            # DecisionOracle shadow (skills.dedupe) — put the same candidate
+            # and existing set to an oracle, then compare it with the FINAL
+            # verdict that ships after the lexical safety net. This function runs
+            # on a worker thread, so submit to the captured loop without waiting.
+            try:
+                from kiro_crew.decisions.points.skills_dedupe import (
+                    shadow_skills_dedupe,
+                )
+
+                asyncio.run_coroutine_threadsafe(
+                    shadow_skills_dedupe(
+                        candidate,
+                        existing,
+                        verdict,
+                        key,
+                        session_key=f"skill_dedupe:{slug}",
+                    ),
+                    loop,
+                )
+            except Exception:
+                self._logger.debug("skills.dedupe shadow hook skipped", exc_info=True)
             return (verdict, key)
         return _lexical()
 

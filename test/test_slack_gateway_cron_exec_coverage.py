@@ -1602,6 +1602,85 @@ class TestCronChannelDelivery:
         orch.slack.post_message.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_confirmed_channel_delivery_runs_the_novelty_observer(self):
+        from kiro_crew.decisions.points import cron_novelty
+
+        transport = _channel_transport()
+        orch = self._orch(transport)
+        orch.slack = None
+        job = _job(id="jn1", name="novelty probe", session_key=_TG_KEY)
+        observer = AsyncMock()
+
+        with (
+            patch.object(gw, "_resolve_channel_target", self._target),
+            patch.object(cron_novelty, "shadow_cron_novelty", observer),
+        ):
+            async with _cron_message_cb(orch, result_text="new result") as callback:
+                await callback(job)
+            await asyncio.sleep(0)
+
+        observer.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_identical_reminder_delivery_skips_the_novelty_observer(self):
+        from kiro_crew.decisions.points import cron_novelty
+
+        transport = _channel_transport()
+        orch = self._orch(transport)
+        orch.slack = None
+        result = "same result"
+        job = _job(
+            id="jn-reminder",
+            name="novelty reminder",
+            session_key=_TG_KEY,
+            last_result=result,
+            last_posted_hash=gw._result_hash(result),
+            last_posted_at=0,
+        )
+        observer = AsyncMock()
+
+        with (
+            patch.object(gw, "_resolve_channel_target", self._target),
+            patch.object(cron_novelty, "shadow_cron_novelty", observer),
+        ):
+            async with _cron_message_cb(orch, result_text=result) as callback:
+                await callback(job)
+            await asyncio.sleep(0)
+
+        transport.send_message.assert_awaited_once()
+        observer.assert_not_awaited()
+
+    @pytest.mark.parametrize("silent,delivery_fails", [(True, False), (False, True)])
+    @pytest.mark.asyncio
+    async def test_unconfirmed_delivery_does_not_run_the_novelty_observer(
+        self, silent, delivery_fails
+    ):
+        from kiro_crew.decisions.points import cron_novelty
+
+        transport = _channel_transport()
+        if delivery_fails:
+            transport.send_message.side_effect = RuntimeError("channel unavailable")
+        orch = self._orch(transport)
+        orch.slack = None
+        job = _job(
+            id="jn2",
+            name="novelty probe",
+            session_key=_TG_KEY,
+            silent=silent,
+        )
+        observer = AsyncMock()
+
+        with (
+            patch.object(gw, "_resolve_channel_target", self._target),
+            patch.object(cron_novelty, "shadow_cron_novelty", observer),
+        ):
+            async with _cron_message_cb(orch, result_text="new result") as callback:
+                await callback(job)
+            await asyncio.sleep(0)
+
+        observer.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_channel_delivery_advances_the_dedup_anchor(self):
         """Regression: the anchor is delivery-agnostic, so a channel post moves it.
 

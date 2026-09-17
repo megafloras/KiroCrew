@@ -108,6 +108,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         (
             ("pod", "Isolated, throwaway, full-stack test instances per worktree"),
             ("eval", "Run multi-session evaluation scenarios"),
+            ("decisions", "Report on the decision-preview shadow log"),
             ("bench", "Run external memory benchmarks (LongMemEval, LoCoMo)"),
             ("perf", "Debug-only performance sampling (off by default)"),
             ("desktop", "Debug-only desktop app diagnostics (requires KIROCREW_DEBUG)"),

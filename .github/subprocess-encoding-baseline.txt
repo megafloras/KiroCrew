@@ -66,7 +66,7 @@
 1 test/test_build_desktop_launcher_symlink.py
 1 test/test_build_desktop_rm_resilient.py
 1 test/test_cli.py
-2 test/test_cli_lazy_imports.py
+1 test/test_cli_lazy_imports.py
 2 test/test_cli_manifest_signature.py
 2 test/test_config_baseline.py
 1 test/test_config_paths.py

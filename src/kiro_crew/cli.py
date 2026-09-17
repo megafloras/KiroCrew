@@ -1184,6 +1184,38 @@ def _builtin_mcp_server_available(name: str) -> bool:
     return finder.find_spec("mcp_server", list(pkg_spec.submodule_search_locations)) is not None
 
 
+def register_decisions_parser(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    decisions_parser = cli_help.add_command(sub, "decisions")
+    decisions_sub = decisions_parser.add_subparsers(dest="decisions_action")
+    report_parser = decisions_sub.add_parser(
+        "report",
+        help="Summarise the decision-preview shadow log",
+        description=(
+            "Read the decision-preview log and report, per decision point and "
+            "implementation, how often the oracle agreed with the shipped logic, "
+            "how well its confidence was calibrated, its latency and its cost."
+        ),
+    )
+    report_parser.add_argument(
+        "--since",
+        default="1d",
+        metavar="WINDOW",
+        help="Window to read: 30m, 12h, 7d, 2w or an ISO timestamp (default: 1d)",
+    )
+    report_parser.add_argument(
+        "--point",
+        default="",
+        metavar="NAME",
+        help="Only this decision point (e.g. skills.select)",
+    )
+    report_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json",
+        help="Emit the report as JSON instead of a table",
+    )
+
+
 def main() -> None:
     """Entry point — parse args and dispatch to the appropriate subcommand."""
     # On Windows, force stdout/stderr to UTF-8 BEFORE anything prints — KiroCrew's
@@ -1871,6 +1903,7 @@ Examples:
     )
 
     register_perf_parser(sub)
+    register_decisions_parser(sub)
     register_bench_parser(sub)
     register_desktop_parser(sub)
 
@@ -3247,6 +3280,12 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         _consolidate_cmd(args)
     elif args.command == "config":
         _config_cmd(args)
+    elif args.command == "decisions":
+        from kiro_crew.cli_decisions import decisions_cmd
+
+        rc = decisions_cmd(args)
+        if rc:
+            raise SystemExit(rc)
     elif args.command == "perf":
         rc = perf_cmd(args)
         if rc:

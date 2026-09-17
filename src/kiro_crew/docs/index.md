@@ -46,6 +46,7 @@ index, first-time setup, and connecting messaging channels.
 | [Session Ledger](session-ledger.md) | A durable per-session record of goal, phase, and next step that survives context compaction |
 | [Browser Control](browser-control.md) | Drive a real web page from the dashboard's Browser panel: navigate, snapshot, click, type, screenshot |
 | [Computer Use](computer-use.md) | Read and drive native desktop applications through the accessibility layer; opt-in and off by default |
+| [Decision Preview](decisions.md) | Ask a small fast judge the same judgement calls Kiro Crew already makes, record whether it would have been right, and change nothing |
 
 ## Additional Features
 

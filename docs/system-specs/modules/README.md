@@ -59,6 +59,7 @@ agent loads only the one it needs.
 | [taskrunner.md](taskrunner.md) | The execution engine that runs a task spec to completion. |
 | [workflows.md](workflows.md) | The dynamic-workflow engine: the frozen `ctx` contract, the event stream, budgets, and the named conformance gates with the test pinning each. |
 | [autopilot.md](autopilot.md) | Plan-driven orchestration and its lifecycle. |
+| [decisions.md](decisions.md) | The decision-oracle seam: the four-condition gate, why the shadow arm returns `None`, the scrub-before-send refusal, the one-line-per-call log, and the report reader's tolerance rules. |
 | [crew-mode.md](crew-mode.md) | Crews: the config record, `select_crew` roster and binding, model and workspace resolution, the Crews UI, and the record of the retired `"crew"` slot mode (Crew Mode). |
 | [pipeline-conductor.md](pipeline-conductor.md) | The `kirocrew-pipeline-conductor` agent and its skill: the generated spec's permission narrowing, the three deterministic scripts, the patrol cycle, and what the RFC leaves unbuilt. |
 | [persistent-agent-channels.md](persistent-agent-channels.md) | Long-lived channels for multi-agent collaboration. |
